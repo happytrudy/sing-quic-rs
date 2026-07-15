@@ -1,0 +1,23 @@
+[package]
+name = "sing-quic"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "QUIC protocol implementations for sing-box-rs"
+
+[dependencies]
+bytes = "1"
+futures = "0.3"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+rand = "0.8"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+rcgen = "0.14"
+
