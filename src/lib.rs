@@ -3,6 +3,7 @@
 //! The first implemented protocol is the authenticated Hysteria2 TCP path.
 
 mod address;
+pub mod congestion;
 mod error;
 pub mod hysteria2;
 mod varint;

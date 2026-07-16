@@ -8,8 +8,19 @@ The implementation follows the Hysteria2 boundaries used by `sing-quic`.
 2. Start an HTTP/3 connection.
 3. Send `POST https://hysteria/auth`.
 4. Put the password in `Hysteria-Auth`.
-5. Send `Hysteria-CC-RX: 0` and randomized `Hysteria-Padding`.
+5. Send the client receive rate in `Hysteria-CC-RX` and randomized
+   `Hysteria-Padding`.
 6. Accept status `233` as successful authentication.
+
+The server responds with its receive rate in `Hysteria-CC-RX`, or `auto` when
+the connection stays on BBR. Each sender uses the lower of its configured send
+rate and the peer receive rate. A positive negotiated rate selects Brutal;
+otherwise the connection stays on the default BBR controller.
+
+When `ignore_client_bandwidth` is enabled without server bandwidth, the server
+forces BBR. When server bandwidth is configured, the same option rejects
+clients that request BBR. This matches the current `sing-quic` negotiation
+behavior.
 
 The server responds with `Hysteria-UDP: false` because UDP forwarding is not
 implemented yet. TLS certificate validation is mandatory; the client API does
@@ -44,9 +55,8 @@ directly so HTTP/3 request parsing cannot consume Hysteria2 `0x401` streams.
 
 ## Current compatibility boundary
 
-The authentication headers, custom status, QUIC varints, TCP request/response
-frames, address representation, and padding ranges match upstream. The current
-implementation intentionally advertises UDP as disabled and does not implement
-bandwidth-based congestion selection, packet obfuscation, port hopping, or NAT
-traversal.
-
+The authentication headers, bandwidth negotiation, BBR/Brutal selection,
+custom status, QUIC varints, TCP request/response frames, address
+representation, and padding ranges match upstream. The current implementation
+intentionally advertises UDP as disabled and does not implement packet
+obfuscation, port hopping, or NAT traversal.

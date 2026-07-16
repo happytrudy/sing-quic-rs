@@ -16,6 +16,30 @@ const MAX_ADDRESS_LENGTH: usize = 2048;
 const MAX_MESSAGE_LENGTH: usize = 2048;
 const MAX_PADDING_LENGTH: usize = 4096;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CongestionReceive {
+    Auto,
+    Rate(u64),
+}
+
+pub(crate) fn parse_congestion_receive(value: Option<&http::HeaderValue>) -> CongestionReceive {
+    let Some(value) = value.and_then(|value| value.to_str().ok()) else {
+        return CongestionReceive::Rate(0);
+    };
+    if value == "auto" {
+        CongestionReceive::Auto
+    } else {
+        CongestionReceive::Rate(value.parse().unwrap_or(0))
+    }
+}
+
+pub(crate) fn congestion_receive_value(value: CongestionReceive) -> String {
+    match value {
+        CongestionReceive::Auto => "auto".to_owned(),
+        CongestionReceive::Rate(bytes_per_second) => bytes_per_second.to_string(),
+    }
+}
+
 pub(crate) fn padding(min: usize, max: usize) -> String {
     let mut rng = rand::thread_rng();
     let length = rng.gen_range(min..max);
@@ -108,5 +132,26 @@ pub(crate) async fn read_tcp_response<R: AsyncRead + Unpin>(reader: &mut R) -> R
             "remote error: {}",
             String::from_utf8_lossy(&message)
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn congestion_receive_header_round_trip() {
+        for value in [
+            CongestionReceive::Auto,
+            CongestionReceive::Rate(0),
+            CongestionReceive::Rate(12_500_000),
+        ] {
+            let encoded = http::HeaderValue::from_str(&congestion_receive_value(value)).unwrap();
+            assert_eq!(parse_congestion_receive(Some(&encoded)), value);
+        }
+        assert_eq!(
+            parse_congestion_receive(Some(&http::HeaderValue::from_static("invalid"))),
+            CongestionReceive::Rate(0)
+        );
     }
 }
