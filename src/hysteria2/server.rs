@@ -5,7 +5,9 @@ use http::{Response, StatusCode};
 use quinn::{Endpoint, ServerConfig, TransportConfig, crypto::rustls::QuicServerConfig};
 use rustls::{
     ServerConfig as RustlsServerConfig,
-    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    pki_types::{
+        CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
+    },
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf},
@@ -68,7 +70,7 @@ impl Server {
             .into_iter()
             .map(CertificateDer::from)
             .collect();
-        let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(options.private_key));
+        let private_key = detect_private_key(options.private_key)?;
         let mut tls = RustlsServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certificates, private_key)?;
@@ -130,6 +132,22 @@ impl Server {
         self.endpoint.wait_idle().await;
         self.accept_task.abort();
     }
+}
+
+fn detect_private_key(key: Vec<u8>) -> Result<PrivateKeyDer<'static>> {
+    let candidates = [
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.clone())),
+        PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(key.clone())),
+        PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(key)),
+    ];
+    let mut last_error = None;
+    for candidate in candidates {
+        match rustls::crypto::ring::sign::any_supported_type(&candidate) {
+            Ok(_) => return Ok(candidate),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(Error::Tls(last_error.expect("private key candidates")))
 }
 
 async fn serve_connection(
