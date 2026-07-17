@@ -3,7 +3,7 @@ mod protocol;
 mod server;
 
 pub use client::{Client, ClientOptions};
-pub use server::{Accepted, Server, ServerOptions, User};
+pub use server::{Accepted, MasqueradeHandler, Server, ServerOptions, User};
 pub use tokio::io::DuplexStream as Hysteria2Stream;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

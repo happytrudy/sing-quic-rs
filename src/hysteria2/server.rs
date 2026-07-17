@@ -1,7 +1,11 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
-use bytes::Bytes;
-use http::{Response, StatusCode};
+use bytes::{Buf, Bytes};
+use futures::future::BoxFuture;
+use http::{
+    Request, Response, StatusCode,
+    header::{CONNECTION, CONTENT_LENGTH, TRANSFER_ENCODING},
+};
 use quinn::{Endpoint, ServerConfig, TransportConfig, crypto::rustls::QuicServerConfig};
 use rustls::{
     ServerConfig as RustlsServerConfig,
@@ -29,6 +33,7 @@ use super::protocol::{
 
 const BRIDGE_CAPACITY: usize = 256 * 1024;
 const ALPN_H3: &[u8] = b"h3";
+const MAX_MASQUERADE_REQUEST_SIZE: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct User {
@@ -42,6 +47,14 @@ pub struct ServerOptions {
     pub certificate_chain: Vec<Vec<u8>>,
     pub private_key: Vec<u8>,
     pub users: Vec<User>,
+}
+
+pub trait MasqueradeHandler: Send + Sync + 'static {
+    fn handle(
+        &self,
+        source: SocketAddr,
+        request: Request<Vec<u8>>,
+    ) -> BoxFuture<'static, Response<Vec<u8>>>;
 }
 
 #[derive(Debug)]
@@ -65,25 +78,15 @@ impl Server {
     }
 
     pub fn bind_with_bandwidth(options: ServerOptions, bandwidth: ServerBandwidth) -> Result<Self> {
-        let certificates = options
-            .certificate_chain
-            .into_iter()
-            .map(CertificateDer::from)
-            .collect();
-        let private_key = detect_private_key(options.private_key)?;
-        let mut tls = RustlsServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certificates, private_key)?;
-        tls.alpn_protocols = vec![ALPN_H3.to_vec()];
-        let crypto =
-            QuicServerConfig::try_from(tls).map_err(|error| Error::QuicTls(error.to_string()))?;
-        let mut transport = TransportConfig::default();
-        transport.congestion_controller_factory(Arc::new(SwitchableCongestionFactory));
-        transport.max_concurrent_bidi_streams((1u32 << 20).into());
-        transport.max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
-        transport.keep_alive_interval(Some(Duration::from_secs(10)));
-        let mut server_config = ServerConfig::with_crypto(Arc::new(crypto));
-        server_config.transport_config(Arc::new(transport));
+        Self::bind_with_bandwidth_and_masquerade(options, bandwidth, None)
+    }
+
+    pub fn bind_with_bandwidth_and_masquerade(
+        options: ServerOptions,
+        bandwidth: ServerBandwidth,
+        masquerade: Option<Arc<dyn MasqueradeHandler>>,
+    ) -> Result<Self> {
+        let server_config = build_server_config(options.certificate_chain, options.private_key)?;
         let endpoint = Endpoint::server(server_config, options.listen)?;
         let users = Arc::new(
             options
@@ -98,11 +101,13 @@ impl Server {
             while let Some(incoming) = accept_endpoint.accept().await {
                 let users = Arc::clone(&users);
                 let sender = sender.clone();
+                let masquerade = masquerade.clone();
                 tokio::spawn(async move {
                     match incoming.await {
                         Ok(connection) => {
                             if let Err(error) =
-                                serve_connection(connection, users, sender, bandwidth).await
+                                serve_connection(connection, users, sender, bandwidth, masquerade)
+                                    .await
                             {
                                 tracing::debug!(%error, "Hysteria2 connection closed");
                             }
@@ -127,11 +132,46 @@ impl Server {
         Ok(self.endpoint.local_addr()?)
     }
 
+    pub fn update_certificate(
+        &self,
+        certificate_chain: Vec<Vec<u8>>,
+        private_key: Vec<u8>,
+    ) -> Result<()> {
+        self.endpoint
+            .set_server_config(Some(build_server_config(certificate_chain, private_key)?));
+        Ok(())
+    }
+
     pub async fn close(&self) {
         self.endpoint.close(0u32.into(), b"server closed");
         self.endpoint.wait_idle().await;
         self.accept_task.abort();
     }
+}
+
+fn build_server_config(
+    certificate_chain: Vec<Vec<u8>>,
+    private_key: Vec<u8>,
+) -> Result<ServerConfig> {
+    let certificates = certificate_chain
+        .into_iter()
+        .map(CertificateDer::from)
+        .collect();
+    let private_key = detect_private_key(private_key)?;
+    let mut tls = RustlsServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)?;
+    tls.alpn_protocols = vec![ALPN_H3.to_vec()];
+    let crypto =
+        QuicServerConfig::try_from(tls).map_err(|error| Error::QuicTls(error.to_string()))?;
+    let mut transport = TransportConfig::default();
+    transport.congestion_controller_factory(Arc::new(SwitchableCongestionFactory));
+    transport.max_concurrent_bidi_streams((1u32 << 20).into());
+    transport.max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
+    transport.keep_alive_interval(Some(Duration::from_secs(10)));
+    let mut server_config = ServerConfig::with_crypto(Arc::new(crypto));
+    server_config.transport_config(Arc::new(transport));
+    Ok(server_config)
 }
 
 fn detect_private_key(key: Vec<u8>) -> Result<PrivateKeyDer<'static>> {
@@ -155,6 +195,7 @@ async fn serve_connection(
     users: Arc<HashMap<String, String>>,
     sender: mpsc::Sender<Accepted>,
     bandwidth: ServerBandwidth,
+    masquerade: Option<Arc<dyn MasqueradeHandler>>,
 ) -> Result<()> {
     let source = connection.remote_address();
     let mut h3_connection: h3::server::Connection<_, Bytes> =
@@ -186,6 +227,23 @@ async fn serve_connection(
         && request.uri().path() == URL_PATH
         && user.is_some()
         && !server_rejects_bbr_client(bandwidth, client_receive);
+    if !authenticated {
+        spawn_masquerade_request(source, request, stream, masquerade.clone());
+        loop {
+            let Some(resolver) = h3_connection
+                .accept()
+                .await
+                .map_err(|error| Error::Http3(error.to_string()))?
+            else {
+                return Ok(());
+            };
+            let (request, stream) = resolver
+                .resolve_request()
+                .await
+                .map_err(|error| Error::Http3(error.to_string()))?;
+            spawn_masquerade_request(source, request, stream, masquerade.clone());
+        }
+    }
     let congestion = if authenticated {
         if let Some(bytes_per_second) = negotiated_send_rate(bandwidth, client_receive)
             && !configure_connection_brutal(&connection, bytes_per_second)
@@ -201,17 +259,13 @@ async fn serve_connection(
     } else {
         CongestionReceive::Rate(bandwidth.receive_bps)
     };
-    let response = if authenticated {
-        Response::builder()
-            .status(StatusCode::from_u16(STATUS_AUTH_OK).expect("valid custom status"))
-            .header(HEADER_UDP, "false")
-            .header(HEADER_CC_RX, congestion_receive_value(advertised_receive))
-            .header(HEADER_PADDING, padding(256, 2048))
-            .body(())
-    } else {
-        Response::builder().status(StatusCode::NOT_FOUND).body(())
-    }
-    .map_err(|error| Error::Protocol(error.to_string()))?;
+    let response = Response::builder()
+        .status(StatusCode::from_u16(STATUS_AUTH_OK).expect("valid custom status"))
+        .header(HEADER_UDP, "false")
+        .header(HEADER_CC_RX, congestion_receive_value(advertised_receive))
+        .header(HEADER_PADDING, padding(256, 2048))
+        .body(())
+        .map_err(|error| Error::Protocol(error.to_string()))?;
     stream
         .send_response(response)
         .await
@@ -220,13 +274,7 @@ async fn serve_connection(
         .finish()
         .await
         .map_err(|error| Error::Http3(error.to_string()))?;
-    let Some(user) = user.filter(|_| authenticated) else {
-        // Keep the connection alive until the client consumes the HTTP error
-        // and closes it. Closing immediately can race the response flight and
-        // turn a useful 404 into a generic QUIC ApplicationClose.
-        let _ = connection.closed().await;
-        return Err(Error::AuthenticationFailed(404));
-    };
+    let user = user.expect("authenticated request has a user");
 
     // Keep the HTTP/3 state alive while raw Hysteria2 streams use the same
     // Quinn connection. The h3 connection is intentionally no longer polled,
@@ -242,6 +290,113 @@ async fn serve_connection(
             }
         });
     }
+}
+
+fn spawn_masquerade_request<S>(
+    source: SocketAddr,
+    request: Request<()>,
+    stream: h3::server::RequestStream<S, Bytes>,
+    masquerade: Option<Arc<dyn MasqueradeHandler>>,
+) where
+    S: h3::quic::BidiStream<Bytes> + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(error) =
+            serve_masquerade_request(source, request, stream, masquerade.as_ref()).await
+        {
+            tracing::debug!(%error, "Hysteria2 masquerade request failed");
+        }
+    });
+}
+
+async fn serve_masquerade_request<S>(
+    source: SocketAddr,
+    request: Request<()>,
+    mut stream: h3::server::RequestStream<S, Bytes>,
+    masquerade: Option<&Arc<dyn MasqueradeHandler>>,
+) -> Result<()>
+where
+    S: h3::quic::BidiStream<Bytes>,
+{
+    let is_head = request.method() == http::Method::HEAD;
+    let (parts, _) = request.into_parts();
+    let mut body = Vec::new();
+    while let Some(mut chunk) = stream
+        .recv_data()
+        .await
+        .map_err(|error| Error::Http3(error.to_string()))?
+    {
+        if body.len().saturating_add(chunk.remaining()) > MAX_MASQUERADE_REQUEST_SIZE {
+            send_masquerade_response(
+                &mut stream,
+                Response::builder()
+                    .status(StatusCode::PAYLOAD_TOO_LARGE)
+                    .body(Vec::new())
+                    .expect("valid response"),
+                is_head,
+            )
+            .await?;
+            return Ok(());
+        }
+        let length = chunk.remaining();
+        body.extend_from_slice(&chunk.copy_to_bytes(length));
+    }
+    let request = Request::from_parts(parts, body);
+    let response = match masquerade {
+        Some(handler) => handler.handle(source, request).await,
+        None => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Vec::new())
+            .expect("valid response"),
+    };
+    send_masquerade_response(&mut stream, response, is_head).await
+}
+
+async fn send_masquerade_response<S>(
+    stream: &mut h3::server::RequestStream<S, Bytes>,
+    response: Response<Vec<u8>>,
+    is_head: bool,
+) -> Result<()>
+where
+    S: h3::quic::BidiStream<Bytes>,
+{
+    let (mut parts, body) = response.into_parts();
+    parts.headers.remove(CONNECTION);
+    parts.headers.remove(TRANSFER_ENCODING);
+    let body_is_allowed = !parts.status.is_informational()
+        && parts.status != StatusCode::NO_CONTENT
+        && parts.status != StatusCode::NOT_MODIFIED;
+    if is_head {
+        if !parts.headers.contains_key(CONTENT_LENGTH) {
+            parts.headers.insert(
+                CONTENT_LENGTH,
+                http::HeaderValue::from_str(&body.len().to_string())
+                    .expect("body length is a valid header value"),
+            );
+        }
+    } else if body_is_allowed {
+        parts.headers.insert(
+            CONTENT_LENGTH,
+            http::HeaderValue::from_str(&body.len().to_string())
+                .expect("body length is a valid header value"),
+        );
+    } else {
+        parts.headers.remove(CONTENT_LENGTH);
+    }
+    stream
+        .send_response(Response::from_parts(parts, ()))
+        .await
+        .map_err(|error| Error::Http3(error.to_string()))?;
+    if !is_head && body_is_allowed && !body.is_empty() {
+        stream
+            .send_data(Bytes::from(body))
+            .await
+            .map_err(|error| Error::Http3(error.to_string()))?;
+    }
+    stream
+        .finish()
+        .await
+        .map_err(|error| Error::Http3(error.to_string()))
 }
 
 async fn handle_stream(
@@ -344,9 +499,106 @@ fn spawn_decode(mut source: quinn::RecvStream, mut destination: WriteHalf<Duplex
 mod tests {
     use super::*;
     use crate::hysteria2::{Client, ClientBandwidth, ClientOptions};
+    use futures::future::poll_fn;
+    use quinn::{ClientConfig, Endpoint, crypto::rustls::QuicClientConfig};
     use rcgen::generate_simple_self_signed;
+    use rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct TestMasquerade;
+
+    impl MasqueradeHandler for TestMasquerade {
+        fn handle(
+            &self,
+            _source: SocketAddr,
+            request: Request<Vec<u8>>,
+        ) -> BoxFuture<'static, Response<Vec<u8>>> {
+            let body = format!("decoy {}", request.uri().path()).into_bytes();
+            Box::pin(async move {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/plain")
+                    .body(body)
+                    .unwrap()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn serves_multiple_masquerade_requests_on_one_connection() {
+        let certificate = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certificate_der = certificate.cert.der().to_vec();
+        let server = Server::bind_with_bandwidth_and_masquerade(
+            ServerOptions {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                certificate_chain: vec![certificate_der.clone()],
+                private_key: certificate.signing_key.serialize_der(),
+                users: vec![User {
+                    name: "alice".into(),
+                    password: "secret".into(),
+                }],
+            },
+            ServerBandwidth::default(),
+            Some(Arc::new(TestMasquerade)),
+        )
+        .unwrap();
+
+        let mut roots = RootCertStore::empty();
+        roots.add(CertificateDer::from(certificate_der)).unwrap();
+        let mut tls = RustlsClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![ALPN_H3.to_vec()];
+        let crypto = QuicClientConfig::try_from(tls).unwrap();
+        let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(ClientConfig::new(Arc::new(crypto)));
+        let connection = endpoint
+            .connect(server.local_addr().unwrap(), "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut driver, mut sender) =
+            h3::client::new(h3_quinn::Connection::new(connection.clone()))
+                .await
+                .unwrap();
+
+        for (method, path) in [
+            (http::Method::GET, "/"),
+            (http::Method::HEAD, "/head"),
+            (http::Method::GET, "/assets/app.js"),
+        ] {
+            let is_head = method == http::Method::HEAD;
+            let request = Request::builder()
+                .method(method)
+                .uri(format!("https://localhost{path}"))
+                .body(())
+                .unwrap();
+            let mut stream = sender.send_request(request).await.unwrap();
+            stream.finish().await.unwrap();
+            let response = stream.recv_response().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(CONTENT_LENGTH).unwrap(),
+                &format!("decoy {path}").len().to_string()
+            );
+            let mut body = Vec::new();
+            while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+                let length = chunk.remaining();
+                body.extend_from_slice(&chunk.copy_to_bytes(length));
+            }
+            if is_head {
+                assert!(body.is_empty());
+            } else {
+                assert_eq!(body, format!("decoy {path}").as_bytes());
+            }
+        }
+
+        connection.close(0u32.into(), b"test complete");
+        let _ = poll_fn(|context| driver.poll_close(context)).await;
+        endpoint.close(0u32.into(), b"test complete");
+        server.close().await;
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
