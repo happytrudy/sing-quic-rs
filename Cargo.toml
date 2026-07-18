@@ -21,3 +21,9 @@ tracing = "0.1"
 
 [dev-dependencies]
 rcgen = "0.14"
+
+[patch.crates-io]
+# Keep the QUIC TLS adapter local so JLS state can be exposed without a
+# dependency on a third-party quinn fork.
+quinn-proto = { path = "vendor/quinn-proto-jls" }
+rustls = { path = "../rustls-reality/rustls" }

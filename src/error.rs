@@ -24,6 +24,8 @@ pub enum Error {
     InvalidVarInt,
     #[error("Hysteria2 authentication failed with HTTP status {0}")]
     AuthenticationFailed(u16),
+    #[error("JLS authentication failed")]
+    JlsAuthenticationFailed,
     #[error("Hysteria2 protocol error: {0}")]
     Protocol(String),
     #[error("HTTP/3 error: {0}")]

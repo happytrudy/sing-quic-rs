@@ -3,7 +3,7 @@ mod metrics;
 mod protocol;
 mod server;
 mod stream;
-mod transport;
+pub(crate) mod transport;
 
 pub use client::{Client, ClientOptions};
 pub use server::{Accepted, MasqueradeHandler, Server, ServerOptions, User};
