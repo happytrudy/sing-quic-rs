@@ -16,9 +16,7 @@ use std::{
 use quinn::{ClientConfig, Endpoint, ServerConfig, crypto::rustls::QuicClientConfig};
 use rustls::{
     ClientConfig as RustlsClientConfig, RootCertStore, ServerConfig as RustlsServerConfig,
-    pki_types::{
-        CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
-    },
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
@@ -40,7 +38,6 @@ pub struct ClientOptions {
     pub server_name: String,
     pub username: String,
     pub password: String,
-    pub ca_certificates: Vec<Vec<u8>>,
     pub zero_rtt: bool,
 }
 
@@ -96,10 +93,9 @@ impl Client {
         if options.server_name.is_empty() {
             return Err(Error::InvalidServerName(options.server_name));
         }
-        let mut roots = RootCertStore::empty();
-        for certificate in &options.ca_certificates {
-            roots.add(CertificateDer::from(certificate.clone()))?;
-        }
+        let roots = RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.into(),
+        };
         let mut tls = RustlsClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
@@ -172,8 +168,6 @@ pub struct User {
 #[derive(Clone, Debug)]
 pub struct ServerOptions {
     pub listen: SocketAddr,
-    pub certificate_chain: Vec<Vec<u8>>,
-    pub private_key: Vec<u8>,
     pub users: Vec<User>,
     pub server_name: Option<String>,
     pub jls_upstream_addr: Option<String>,
@@ -245,13 +239,12 @@ impl Server {
 }
 
 fn build_server_config(options: &ServerOptions) -> Result<ServerConfig> {
-    let certificates = options
-        .certificate_chain
-        .iter()
-        .cloned()
-        .map(CertificateDer::from)
-        .collect();
-    let private_key = detect_private_key(options.private_key.clone())?;
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+        .map_err(|error| Error::QuicTls(format!("generate ephemeral certificate: {error}")))?;
+    let certificates = vec![CertificateDer::from(certificate.cert)];
+    let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        certificate.signing_key.serialize_der(),
+    ));
     let mut tls = RustlsServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certificates, private_key)?;
@@ -275,20 +268,6 @@ fn build_server_config(options: &ServerOptions) -> Result<ServerConfig> {
     let mut config = ServerConfig::with_crypto(Arc::new(crypto));
     config.transport_config(Arc::new(base_transport_config()));
     Ok(config)
-}
-
-fn detect_private_key(key: Vec<u8>) -> Result<PrivateKeyDer<'static>> {
-    let candidates = [
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.clone())),
-        PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(key.clone())),
-        PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(key)),
-    ];
-    for candidate in candidates {
-        if rustls::crypto::ring::sign::any_supported_type(&candidate).is_ok() {
-            return Ok(candidate);
-        }
-    }
-    Err(Error::InvalidPrivateKey)
 }
 
 async fn serve_connection(
@@ -388,7 +367,6 @@ async fn decode_address(recv: &mut quinn::RecvStream) -> Result<Address> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcgen::generate_simple_self_signed;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
@@ -400,13 +378,9 @@ mod tests {
 
     #[tokio::test]
     async fn jls_authenticated_tcp_stream_round_trip() {
-        let certificate = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let certificate_der = certificate.cert.der().to_vec();
         let server = Arc::new(
             Server::bind(ServerOptions {
                 listen: "127.0.0.1:0".parse().unwrap(),
-                certificate_chain: vec![certificate_der.clone()],
-                private_key: certificate.signing_key.serialize_der(),
                 users: vec![User {
                     name: "alice".into(),
                     password: "secret".into(),
@@ -433,7 +407,6 @@ mod tests {
             server_name: "localhost".into(),
             username: "alice".into(),
             password: "secret".into(),
-            ca_certificates: vec![certificate_der],
             zero_rtt: true,
         })
         .unwrap();
