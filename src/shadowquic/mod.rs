@@ -9,7 +9,7 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, RwLock},
     task::{Context, Poll},
 };
 
@@ -23,6 +23,10 @@ use tokio::{
     sync::{Mutex, mpsc},
 };
 
+use crate::congestion::{
+    CongestionKind, configure_connection_bbr, configure_connection_brutal_with_options,
+    connection_congestion_kind,
+};
 use crate::hysteria2::transport::{base_transport_config, bind_endpoint};
 use crate::{Address, Error, Result};
 
@@ -32,12 +36,23 @@ const SQ_DOMAIN: u8 = 0x03;
 const SQ_IPV6: u8 = 0x04;
 const MAX_DOMAIN_LENGTH: usize = u8::MAX as usize;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CongestionConfig {
+    #[default]
+    Bbr,
+    Brutal {
+        bytes_per_second: u64,
+        disable_loss_compensation: bool,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct ClientOptions {
     pub server: SocketAddr,
     pub server_name: String,
     pub username: String,
     pub password: String,
+    pub congestion: CongestionConfig,
     pub zero_rtt: bool,
 }
 
@@ -130,6 +145,7 @@ impl Client {
             .endpoint
             .connect(self.options.server, &self.options.server_name)?;
         let connection = connecting.await?;
+        apply_congestion(&connection, self.options.congestion)?;
         if let Some(data) = connection.handshake_data()
             && let Some(data) = data.downcast_ref::<quinn_proto::crypto::rustls::HandshakeData>()
             && data.jls_authenticated != Some(true)
@@ -154,6 +170,11 @@ impl Client {
         Ok(self.endpoint.local_addr()?)
     }
 
+    pub async fn congestion_kind(&self) -> Option<CongestionKind> {
+        let connection = self.connection.lock().await;
+        connection.as_ref().and_then(connection_congestion_kind)
+    }
+
     pub fn close(&self) {
         self.endpoint.close(0u32.into(), b"client closed");
     }
@@ -172,6 +193,7 @@ pub struct ServerOptions {
     pub server_name: Option<String>,
     pub jls_upstream_addr: Option<String>,
     pub jls_rate_limit: u64,
+    pub congestion: CongestionConfig,
     pub zero_rtt: bool,
 }
 
@@ -187,6 +209,7 @@ pub struct Server {
     endpoint: Endpoint,
     incoming: Mutex<mpsc::Receiver<Accepted>>,
     accept_task: tokio::task::JoinHandle<()>,
+    congestion: Arc<RwLock<CongestionConfig>>,
 }
 
 impl Server {
@@ -195,12 +218,22 @@ impl Server {
         let endpoint = bind_endpoint(options.listen, Some(server_config))?;
         let (sender, receiver) = mpsc::channel(256);
         let accept_endpoint = endpoint.clone();
+        let congestion = Arc::new(RwLock::new(options.congestion));
+        let accept_congestion = Arc::clone(&congestion);
         let accept_task = tokio::spawn(async move {
             while let Some(incoming) = accept_endpoint.accept().await {
                 let sender = sender.clone();
+                let congestion = *accept_congestion
+                    .read()
+                    .expect("ShadowQuic congestion lock");
                 tokio::spawn(async move {
                     match incoming.await {
                         Ok(connection) => {
+                            if let Err(error) = apply_congestion(&connection, congestion) {
+                                connection.close(0u32.into(), b"congestion control failed");
+                                tracing::debug!(%error, "ShadowQuic congestion setup failed");
+                                return;
+                            }
                             if let Err(error) = serve_connection(connection, sender).await {
                                 tracing::debug!(%error, "ShadowQuic connection closed");
                             }
@@ -214,6 +247,7 @@ impl Server {
             endpoint,
             incoming: Mutex::new(receiver),
             accept_task,
+            congestion,
         })
     }
 
@@ -226,6 +260,7 @@ impl Server {
     }
 
     pub fn update_config(&self, options: ServerOptions) -> Result<()> {
+        *self.congestion.write().expect("ShadowQuic congestion lock") = options.congestion;
         self.endpoint
             .set_server_config(Some(build_server_config(&options)?));
         Ok(())
@@ -235,6 +270,25 @@ impl Server {
         self.endpoint.close(0u32.into(), b"server closed");
         self.endpoint.wait_idle().await;
         self.accept_task.abort();
+    }
+}
+
+fn apply_congestion(connection: &quinn::Connection, congestion: CongestionConfig) -> Result<()> {
+    let configured = match congestion {
+        CongestionConfig::Bbr => configure_connection_bbr(connection),
+        CongestionConfig::Brutal {
+            bytes_per_second,
+            disable_loss_compensation,
+        } => configure_connection_brutal_with_options(
+            connection,
+            bytes_per_second,
+            disable_loss_compensation,
+        ),
+    };
+    if configured {
+        Ok(())
+    } else {
+        Err(Error::CongestionControl)
     }
 }
 
@@ -388,6 +442,10 @@ mod tests {
                 server_name: Some("localhost".into()),
                 jls_upstream_addr: None,
                 jls_rate_limit: u64::MAX,
+                congestion: CongestionConfig::Brutal {
+                    bytes_per_second: 12_500_000,
+                    disable_loss_compensation: false,
+                },
                 zero_rtt: true,
             })
             .unwrap(),
@@ -407,6 +465,10 @@ mod tests {
             server_name: "localhost".into(),
             username: "alice".into(),
             password: "secret".into(),
+            congestion: CongestionConfig::Brutal {
+                bytes_per_second: 12_500_000,
+                disable_loss_compensation: false,
+            },
             zero_rtt: true,
         })
         .unwrap();
@@ -414,6 +476,12 @@ mod tests {
             .connect(Address::new("example.com", 443).unwrap())
             .await
             .unwrap();
+        assert_eq!(
+            client.congestion_kind().await,
+            Some(CongestionKind::Brutal {
+                bytes_per_second: 12_500_000
+            })
+        );
         stream.write_all(b"ping").await.unwrap();
         stream.flush().await.unwrap();
         let mut response = [0u8; 4];

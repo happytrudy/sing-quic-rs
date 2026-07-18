@@ -30,7 +30,7 @@ pub enum Error {
     Protocol(String),
     #[error("HTTP/3 error: {0}")]
     Http3(String),
-    #[error("QUIC connection does not use the Hysteria congestion controller")]
+    #[error("QUIC connection does not use the switchable congestion controller")]
     CongestionControl,
     #[error("service is closed")]
     Closed,
