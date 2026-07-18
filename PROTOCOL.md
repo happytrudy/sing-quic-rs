@@ -12,15 +12,15 @@ The implementation follows the Hysteria2 boundaries used by `sing-quic`.
    `Hysteria-Padding`.
 6. Accept status `233` as successful authentication.
 
-The server responds with its receive rate in `Hysteria-CC-RX`, or `auto` when
-the connection stays on BBR. Each sender uses the lower of its configured send
-rate and the peer receive rate. A positive negotiated rate selects Brutal;
-otherwise the connection stays on the default BBR controller.
+The server responds with its receive rate in `Hysteria-CC-RX`. Each sender uses
+the lower of its configured send rate and the peer receive rate. A positive
+negotiated rate selects Brutal; otherwise the connection stays on the default
+BBR controller.
 
-When `ignore_client_bandwidth` is enabled without server bandwidth, the server
-forces BBR. When server bandwidth is configured, the same option rejects
-clients that request BBR. This matches the current `sing-quic` negotiation
-behavior.
+When `ignore_client_bandwidth` is enabled, the server ignores bandwidth hints,
+keeps its configured non-Brutal controller, and responds with `auto` so the
+client does the same. It does not reject clients based on their bandwidth
+header.
 
 The server responds with `Hysteria-UDP: false` because UDP forwarding is not
 implemented yet. TLS certificate validation is mandatory; the client API does
@@ -29,7 +29,21 @@ not expose an insecure verifier.
 ## TCP stream
 
 Each proxied TCP connection uses a new QUIC bidirectional stream on the
-authenticated connection.
+authenticated connection. The public stream directly wraps Quinn's send and
+receive halves; there is no intermediate duplex buffer or copy task. Both
+endpoints start with a 20 MiB connection flow-control window, then refresh the
+send and receive windows once per second from the negotiated byte rate and
+current RTT. The target has two BDPs of headroom, and the send window is also
+kept above twice the active congestion window. Per-stream credit is governed
+by the aggregate connection window. Endpoints request 16 MiB operating-system
+UDP socket buffers and report when the host limits the requested size.
+
+Loss compensation is enabled by default and can be disabled independently on
+each sender. It measures acknowledged and lost bytes in one-second buckets and
+updates the delivery rate using EWMA. Brutal starts from the larger of one BDP
+or ten current-MTU packets. Optional two-second connection metrics expose the
+negotiated controller, RTT, congestion window, path MTU, measured throughput,
+and loss.
 
 ```text
 request:

@@ -19,7 +19,11 @@ Implemented:
 - QUIC variable integer framing
 - request and response padding
 - multiplexed TCP streams over one authenticated QUIC connection
-- Tokio `DuplexStream` client/server API
+- direct Tokio `AsyncRead + AsyncWrite` streams over Quinn without an
+  intermediate copy bridge
+- adaptive QUIC flow control with a 20 MiB baseline and runtime RTT/BDP updates
+- 16 MiB UDP socket buffer requests with actual-size diagnostics
+- optional loss compensation and two-second connection metrics
 - endpoint shutdown and connection reuse
 
 Not implemented yet:
@@ -42,11 +46,36 @@ connection through `configure_connection_brutal` and
 `configure_connection_bbr`. This API is intended to be shared by Hysteria2,
 TUIC, ShadowQUIC, SunnyQUIC, and other Quinn-based transports.
 
-Brutal implements the target window and ACK/loss compensation and reports its
-target pacing rate. Quinn 0.11 only exposes that rate as a metric; its generic
-pacer still derives pacing from the congestion window. Exact independent
-Brutal pacing therefore requires a future Quinn/h3-quinn dependency line that
-consumes controller pacing rates.
+Brutal implements a Quinn-adapted target window and ACK/loss compensation.
+Quinn 0.11 derives pacing from the congestion window instead of accepting a
+per-connection controller rate, so the window uses one target BDP rather than
+the upstream Go implementation's two BDP plus independent token-bucket pacer.
+This prevents a negotiated 100 Mbps connection from being paced at several
+times that rate. Exact upstream pacing can replace this adaptation when an
+official Quinn API supports runtime per-connection pacing rates.
+
+The QUIC send and connection receive windows are refreshed once per second.
+They use two bandwidth-delay products of headroom, while the send window also
+stays above twice the active congestion window. Stream credit is governed by
+the adaptive aggregate connection window instead of imposing a second fixed
+per-stream ceiling.
+
+Loss compensation samples acknowledged and lost bytes in one-second buckets.
+Each complete bucket updates the delivery rate with a 0.25 EWMA factor and an
+0.8 floor. The Brutal startup window uses one target BDP and never falls below
+ten current path-MTU packets. `disable_loss_compensation` is local to the
+sender. Connection metrics are opt-in and report RTT, congestion window, path
+MTU, loss, congestion events, and measured UDP send/receive Mbps every two
+seconds.
+
+The endpoint requests 16 MiB UDP send and receive socket buffers. Operating
+systems may cap the request and the runtime logs both actual values. On Linux,
+raise the host limits when the warning is present, for example:
+
+```bash
+sysctl -w net.core.rmem_max=16777216
+sysctl -w net.core.wmem_max=16777216
+```
 
 ## Test
 

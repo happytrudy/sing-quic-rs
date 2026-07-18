@@ -9,11 +9,18 @@ use std::{
 use quinn::congestion::{BbrConfig, Controller, ControllerFactory, ControllerMetrics};
 use quinn_proto::RttEstimator;
 
-const SLOT_COUNT: usize = 5;
-const MIN_SAMPLE_COUNT: u64 = 50;
+const MIN_SAMPLE_PACKETS_PER_SECOND: u64 = 10;
 const MIN_ACK_RATE: f64 = 0.8;
-const WINDOW_MULTIPLIER: f64 = 2.0;
+const LOSS_EWMA_ALPHA: f64 = 0.25;
+// Upstream Hysteria uses a 2 BDP window together with an independent
+// token-bucket pacer. Quinn 0.11 derives its pacing rate from cwnd / RTT, so a
+// 2 BDP window would send far above the negotiated Brutal rate. One BDP keeps
+// the effective rate at the negotiated target while retaining loss
+// compensation through ack_rate.
+const WINDOW_MULTIPLIER: f64 = 1.0;
 const INITIAL_WINDOW: u64 = 10_240;
+const INITIAL_WINDOW_PACKETS: u64 = 10;
+const DEFAULT_INITIAL_RTT: Duration = Duration::from_millis(100);
 
 /// Rate-based Brutal congestion controller configuration.
 ///
@@ -23,6 +30,7 @@ const INITIAL_WINDOW: u64 = 10_240;
 pub struct BrutalConfig {
     bytes_per_second: u64,
     initial_window: u64,
+    disable_loss_compensation: bool,
 }
 
 impl BrutalConfig {
@@ -31,6 +39,7 @@ impl BrutalConfig {
         Self {
             bytes_per_second,
             initial_window: INITIAL_WINDOW,
+            disable_loss_compensation: false,
         }
     }
 
@@ -42,6 +51,11 @@ impl BrutalConfig {
         self.initial_window = bytes.max(1);
         self
     }
+
+    pub fn disable_loss_compensation(&mut self, disabled: bool) -> &mut Self {
+        self.disable_loss_compensation = disabled;
+        self
+    }
 }
 
 impl ControllerFactory for BrutalConfig {
@@ -51,10 +65,10 @@ impl ControllerFactory for BrutalConfig {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct PacketSlot {
+struct ByteSample {
     timestamp: i64,
-    acknowledged: u64,
-    lost: u64,
+    acknowledged_bytes: u64,
+    lost_bytes: u64,
 }
 
 /// Protocol-independent Brutal congestion controller.
@@ -62,8 +76,9 @@ struct PacketSlot {
 pub struct Brutal {
     config: Arc<BrutalConfig>,
     current_mtu: u64,
-    slots: [PacketSlot; SLOT_COUNT],
+    byte_sample: Option<ByteSample>,
     ack_rate: f64,
+    ack_rate_initialized: bool,
     smoothed_rtt: Duration,
     epoch: Option<Instant>,
 }
@@ -73,9 +88,14 @@ impl Brutal {
         Self {
             config,
             current_mtu: u64::from(current_mtu),
-            slots: [PacketSlot::default(); SLOT_COUNT],
+            byte_sample: None,
             ack_rate: 1.0,
-            smoothed_rtt: initial_rtt,
+            ack_rate_initialized: false,
+            smoothed_rtt: if initial_rtt.is_zero() {
+                DEFAULT_INITIAL_RTT
+            } else {
+                initial_rtt
+            },
             epoch: None,
         }
     }
@@ -85,64 +105,79 @@ impl Brutal {
         now.saturating_duration_since(epoch).as_secs() as i64
     }
 
-    fn record_acknowledged(&mut self, now: Instant) {
+    fn advance_byte_sample(&mut self, now: Instant) {
         let timestamp = self.timestamp(now);
-        let slot = &mut self.slots[timestamp as usize % SLOT_COUNT];
-        if slot.timestamp == timestamp {
-            slot.acknowledged += 1;
-        } else {
-            *slot = PacketSlot {
-                timestamp,
-                acknowledged: 1,
-                lost: 0,
-            };
+        if self
+            .byte_sample
+            .is_some_and(|sample| sample.timestamp == timestamp)
+        {
+            return;
         }
+        if let Some(sample) = self.byte_sample.take() {
+            self.apply_byte_sample(sample);
+        }
+        self.byte_sample = Some(ByteSample {
+            timestamp,
+            ..ByteSample::default()
+        });
+    }
+
+    fn apply_byte_sample(&mut self, sample: ByteSample) {
+        if self.config.disable_loss_compensation {
+            self.ack_rate = 1.0;
+            self.ack_rate_initialized = false;
+            return;
+        }
+        let total_bytes = sample.acknowledged_bytes.saturating_add(sample.lost_bytes);
+        let minimum_sample_bytes = self
+            .current_mtu
+            .saturating_mul(MIN_SAMPLE_PACKETS_PER_SECOND);
+        if total_bytes < minimum_sample_bytes {
+            return;
+        }
+        let sample_ack_rate =
+            (sample.acknowledged_bytes as f64 / total_bytes as f64).clamp(MIN_ACK_RATE, 1.0);
+        if self.ack_rate_initialized {
+            self.ack_rate =
+                (1.0 - LOSS_EWMA_ALPHA) * self.ack_rate + LOSS_EWMA_ALPHA * sample_ack_rate;
+        } else {
+            self.ack_rate = sample_ack_rate;
+            self.ack_rate_initialized = true;
+        }
+    }
+
+    fn record_acknowledged(&mut self, now: Instant, acknowledged_bytes: u64) {
+        self.advance_byte_sample(now);
+        let sample = self.byte_sample.as_mut().expect("byte sample initialized");
+        sample.acknowledged_bytes = sample.acknowledged_bytes.saturating_add(acknowledged_bytes);
     }
 
     fn record_lost(&mut self, now: Instant, lost_bytes: u64) {
-        if lost_bytes == 0 {
-            return;
-        }
-        let timestamp = self.timestamp(now);
-        let lost_packets = lost_bytes.div_ceil(self.current_mtu.max(1));
-        let slot = &mut self.slots[timestamp as usize % SLOT_COUNT];
-        if slot.timestamp == timestamp {
-            slot.lost += lost_packets;
-        } else {
-            *slot = PacketSlot {
-                timestamp,
-                acknowledged: 0,
-                lost: lost_packets,
-            };
-        }
+        self.advance_byte_sample(now);
+        let sample = self.byte_sample.as_mut().expect("byte sample initialized");
+        sample.lost_bytes = sample.lost_bytes.saturating_add(lost_bytes);
     }
 
-    fn update_ack_rate(&mut self, now: Instant) {
-        let minimum_timestamp = self.timestamp(now) - SLOT_COUNT as i64;
-        let (acknowledged, lost) = self
-            .slots
-            .iter()
-            .filter(|slot| slot.timestamp >= minimum_timestamp)
-            .fold((0, 0), |(acknowledged, lost), slot| {
-                (acknowledged + slot.acknowledged, lost + slot.lost)
-            });
-        let total = acknowledged + lost;
-        self.ack_rate = if total < MIN_SAMPLE_COUNT {
-            1.0
-        } else {
-            (acknowledged as f64 / total as f64).max(MIN_ACK_RATE)
-        };
+    fn minimum_window(&self) -> u64 {
+        self.config
+            .initial_window
+            .max(self.current_mtu.saturating_mul(INITIAL_WINDOW_PACKETS))
+    }
+
+    fn target_bdp(&self) -> u64 {
+        (self.config.bytes_per_second as f64 * self.smoothed_rtt.as_secs_f64()) as u64
+    }
+
+    fn startup_window(&self) -> u64 {
+        self.target_bdp().max(self.minimum_window())
     }
 
     fn congestion_window(&self) -> u64 {
-        if self.smoothed_rtt.is_zero() {
-            return self.config.initial_window.max(self.current_mtu);
-        }
         let window = self.config.bytes_per_second as f64
             * self.smoothed_rtt.as_secs_f64()
             * WINDOW_MULTIPLIER
             / self.ack_rate;
-        (window as u64).max(self.current_mtu)
+        (window as u64).max(self.minimum_window())
     }
 
     fn pacing_rate_bits_per_second(&self) -> u64 {
@@ -155,12 +190,12 @@ impl Controller for Brutal {
         &mut self,
         now: Instant,
         _sent: Instant,
-        _bytes: u64,
+        bytes: u64,
         _app_limited: bool,
         rtt: &RttEstimator,
     ) {
         self.smoothed_rtt = rtt.get();
-        self.record_acknowledged(now);
+        self.record_acknowledged(now, bytes);
     }
 
     fn on_end_acks(
@@ -170,7 +205,7 @@ impl Controller for Brutal {
         _app_limited: bool,
         _largest_packet_num_acked: Option<u64>,
     ) {
-        self.update_ack_rate(now);
+        self.advance_byte_sample(now);
     }
 
     fn on_congestion_event(
@@ -181,7 +216,6 @@ impl Controller for Brutal {
         lost_bytes: u64,
     ) {
         self.record_lost(now, lost_bytes);
-        self.update_ack_rate(now);
     }
 
     fn on_mtu_update(&mut self, new_mtu: u16) {
@@ -204,7 +238,7 @@ impl Controller for Brutal {
     }
 
     fn initial_window(&self) -> u64 {
-        self.config.initial_window.max(self.current_mtu)
+        self.startup_window()
     }
 
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
@@ -241,10 +275,17 @@ impl SwitchableController {
         state.kind = CongestionKind::Bbr;
     }
 
-    fn set_brutal(&self, bytes_per_second: u64, initial_rtt: Duration) {
+    fn set_brutal(
+        &self,
+        bytes_per_second: u64,
+        initial_rtt: Duration,
+        disable_loss_compensation: bool,
+    ) {
         let mut state = self.state.lock().expect("congestion state lock");
+        let mut config = BrutalConfig::new(bytes_per_second);
+        config.disable_loss_compensation(disable_loss_compensation);
         state.controller = Box::new(Brutal::new(
-            Arc::new(BrutalConfig::new(bytes_per_second)),
+            Arc::new(config),
             state.current_mtu,
             initial_rtt,
         ));
@@ -374,6 +415,15 @@ impl ControllerFactory for SwitchableCongestionFactory {
 
 /// Switches an established Quinn connection to Brutal.
 pub fn configure_connection_brutal(connection: &quinn::Connection, bytes_per_second: u64) -> bool {
+    configure_connection_brutal_with_options(connection, bytes_per_second, false)
+}
+
+/// Switches an established Quinn connection to Brutal with loss policy.
+pub fn configure_connection_brutal_with_options(
+    connection: &quinn::Connection,
+    bytes_per_second: u64,
+    disable_loss_compensation: bool,
+) -> bool {
     if bytes_per_second == 0 {
         return false;
     }
@@ -381,7 +431,11 @@ pub fn configure_connection_brutal(connection: &quinn::Connection, bytes_per_sec
     let Ok(controller) = controller.downcast::<SwitchableController>() else {
         return false;
     };
-    controller.set_brutal(bytes_per_second, connection.rtt());
+    controller.set_brutal(
+        bytes_per_second,
+        connection.rtt(),
+        disable_loss_compensation,
+    );
     true
 }
 
@@ -422,7 +476,7 @@ mod tests {
             .downcast::<SwitchableController>()
             .unwrap();
         assert_eq!(switchable.kind(), CongestionKind::Bbr);
-        switchable.set_brutal(1_000_000, Duration::from_millis(100));
+        switchable.set_brutal(1_000_000, Duration::from_millis(100), false);
         assert_eq!(
             switchable.kind(),
             CongestionKind::Brutal {
@@ -434,22 +488,39 @@ mod tests {
     }
 
     #[test]
-    fn brutal_window_is_twice_the_target_bdp() {
+    fn brutal_window_matches_target_bdp_for_quinn_pacing() {
         let controller = brutal(1_000_000, Duration::from_millis(100));
-        assert_eq!(controller.window(), 200_000);
+        assert_eq!(controller.window(), 100_000);
         assert_eq!(controller.metrics().pacing_rate, Some(8_000_000));
+    }
+
+    #[test]
+    fn brutal_window_does_not_collapse_below_ten_mtu_packets() {
+        let controller = brutal(1_000_000, Duration::from_micros(100));
+        assert_eq!(controller.window(), 12_000);
+    }
+
+    #[test]
+    fn brutal_100_mbps_window_scales_across_wan_rtt() {
+        let bytes_per_second = 12_500_000;
+        for (rtt, expected_window) in [
+            (Duration::from_millis(50), 625_000),
+            (Duration::from_millis(100), 1_250_000),
+            (Duration::from_millis(200), 2_500_000),
+        ] {
+            assert_eq!(brutal(bytes_per_second, rtt).window(), expected_window);
+        }
     }
 
     #[test]
     fn brutal_compensates_for_loss_and_clamps_ack_rate() {
         let mut controller = brutal(1_000_000, Duration::from_millis(100));
         let now = Instant::now();
-        for _ in 0..40 {
-            controller.record_acknowledged(now);
-        }
+        controller.record_acknowledged(now, 48_000);
         controller.on_congestion_event(now, now, false, 12_000);
+        controller.advance_byte_sample(now + Duration::from_secs(1));
         assert_eq!(controller.ack_rate, MIN_ACK_RATE);
-        assert_eq!(controller.window(), 250_000);
+        assert_eq!(controller.window(), 125_000);
         assert_eq!(controller.metrics().pacing_rate, Some(10_000_000));
     }
 
@@ -457,9 +528,57 @@ mod tests {
     fn insufficient_samples_assume_perfect_delivery() {
         let mut controller = brutal(1_000_000, Duration::from_millis(100));
         let now = Instant::now();
-        controller.record_acknowledged(now);
-        controller.record_lost(now, 1200);
-        controller.update_ack_rate(now);
+        controller.record_acknowledged(now, 1_000);
+        controller.record_lost(now, 1_000);
+        controller.advance_byte_sample(now + Duration::from_secs(1));
         assert_eq!(controller.ack_rate, 1.0);
+    }
+
+    #[test]
+    fn brutal_loss_samples_use_bytes_instead_of_packet_callbacks() {
+        let mut controller = brutal(1_000_000, Duration::from_millis(100));
+        let now = Instant::now();
+        controller.record_acknowledged(now, 54_000);
+        controller.record_lost(now, 6_000);
+        controller.advance_byte_sample(now + Duration::from_secs(1));
+        assert_eq!(controller.ack_rate, 0.9);
+    }
+
+    #[test]
+    fn brutal_loss_compensation_uses_per_second_ewma() {
+        let mut controller = brutal(1_000_000, Duration::from_millis(100));
+        let now = Instant::now();
+        controller.record_acknowledged(now, 48_000);
+        controller.record_lost(now, 12_000);
+        controller.advance_byte_sample(now + Duration::from_secs(1));
+        assert_eq!(controller.ack_rate, 0.8);
+
+        controller.record_acknowledged(now + Duration::from_secs(1), 60_000);
+        controller.advance_byte_sample(now + Duration::from_secs(2));
+        assert!((controller.ack_rate - 0.85).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn brutal_startup_window_tracks_mtu_and_initial_rtt() {
+        let mut controller = brutal(1, Duration::from_millis(1));
+        assert_eq!(controller.initial_window(), 12_000);
+        controller.on_mtu_update(1400);
+        assert_eq!(controller.initial_window(), 14_000);
+
+        let controller = Brutal::new(Arc::new(BrutalConfig::new(1_000_000)), 1200, Duration::ZERO);
+        assert_eq!(controller.initial_window(), 100_000);
+    }
+
+    #[test]
+    fn brutal_can_disable_loss_compensation() {
+        let mut config = BrutalConfig::new(1_000_000);
+        config.disable_loss_compensation(true);
+        let mut controller = Brutal::new(Arc::new(config), 1200, Duration::from_millis(100));
+        let now = Instant::now();
+        controller.record_acknowledged(now, 48_000);
+        controller.record_lost(now, 12_000);
+        controller.advance_byte_sample(now + Duration::from_secs(1));
+        assert_eq!(controller.ack_rate, 1.0);
+        assert_eq!(controller.window(), 100_000);
     }
 }

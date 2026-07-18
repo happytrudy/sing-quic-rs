@@ -6,6 +6,7 @@ mod address;
 pub mod congestion;
 mod error;
 pub mod hysteria2;
+pub mod transport;
 mod varint;
 
 pub use address::Address;

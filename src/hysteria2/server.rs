@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use bytes::{Buf, Bytes};
 use futures::future::BoxFuture;
@@ -6,32 +6,32 @@ use http::{
     Request, Response, StatusCode,
     header::{CONNECTION, CONTENT_LENGTH, TRANSFER_ENCODING},
 };
-use quinn::{Endpoint, ServerConfig, TransportConfig, crypto::rustls::QuicServerConfig};
+use quinn::{Endpoint, ServerConfig, crypto::rustls::QuicServerConfig};
 use rustls::{
     ServerConfig as RustlsServerConfig,
     pki_types::{
         CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
     },
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf},
-    sync::{Mutex, mpsc},
-};
+use tokio::sync::{Mutex, mpsc};
 
 use crate::congestion::{
-    CongestionKind, SwitchableCongestionFactory, configure_connection_brutal,
-    connection_congestion_kind,
+    CongestionKind, configure_connection_brutal_with_options, connection_congestion_kind,
 };
+use crate::transport::AdaptiveWindowTask;
 use crate::{Address, Error, Result};
 
-use super::ServerBandwidth;
 use super::protocol::{
     CongestionReceive, HEADER_AUTH, HEADER_CC_RX, HEADER_PADDING, HEADER_UDP, STATUS_AUTH_OK,
     URL_AUTHORITY, URL_PATH, congestion_receive_value, padding, parse_congestion_receive,
     read_tcp_request, write_tcp_response,
 };
+use super::{
+    Hysteria2Stream, ServerBandwidth,
+    metrics::ConnectionMetricsTask,
+    transport::{base_transport_config, bind_endpoint},
+};
 
-const BRIDGE_CAPACITY: usize = 256 * 1024;
 const ALPN_H3: &[u8] = b"h3";
 const MAX_MASQUERADE_REQUEST_SIZE: usize = 16 * 1024 * 1024;
 
@@ -59,7 +59,7 @@ pub trait MasqueradeHandler: Send + Sync + 'static {
 
 #[derive(Debug)]
 pub struct Accepted {
-    pub stream: DuplexStream,
+    pub stream: Hysteria2Stream,
     pub destination: Address,
     pub user: String,
     pub source: SocketAddr,
@@ -87,7 +87,7 @@ impl Server {
         masquerade: Option<Arc<dyn MasqueradeHandler>>,
     ) -> Result<Self> {
         let server_config = build_server_config(options.certificate_chain, options.private_key)?;
-        let endpoint = Endpoint::server(server_config, options.listen)?;
+        let endpoint = bind_endpoint(options.listen, Some(server_config))?;
         let users = Arc::new(
             options
                 .users
@@ -164,11 +164,8 @@ fn build_server_config(
     tls.alpn_protocols = vec![ALPN_H3.to_vec()];
     let crypto =
         QuicServerConfig::try_from(tls).map_err(|error| Error::QuicTls(error.to_string()))?;
-    let mut transport = TransportConfig::default();
-    transport.congestion_controller_factory(Arc::new(SwitchableCongestionFactory));
-    transport.max_concurrent_bidi_streams((1u32 << 20).into());
-    transport.max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
-    transport.keep_alive_interval(Some(Duration::from_secs(10)));
+    let mut transport = base_transport_config();
+    transport.max_concurrent_bidi_streams(1024u32.into());
     let mut server_config = ServerConfig::with_crypto(Arc::new(crypto));
     server_config.transport_config(Arc::new(transport));
     Ok(server_config)
@@ -225,8 +222,7 @@ async fn serve_connection(
     let authenticated = request.method() == http::Method::POST
         && authority_matches
         && request.uri().path() == URL_PATH
-        && user.is_some()
-        && !server_rejects_bbr_client(bandwidth, client_receive);
+        && user.is_some();
     if !authenticated {
         spawn_masquerade_request(source, request, stream, masquerade.clone());
         loop {
@@ -244,9 +240,18 @@ async fn serve_connection(
             spawn_masquerade_request(source, request, stream, masquerade.clone());
         }
     }
+    let send_rate = if bandwidth.ignore_client_bandwidth {
+        None
+    } else {
+        negotiated_send_rate(bandwidth, client_receive)
+    };
     let congestion = if authenticated {
-        if let Some(bytes_per_second) = negotiated_send_rate(bandwidth, client_receive)
-            && !configure_connection_brutal(&connection, bytes_per_second)
+        if let Some(bytes_per_second) = send_rate
+            && !configure_connection_brutal_with_options(
+                &connection,
+                bytes_per_second,
+                bandwidth.disable_loss_compensation,
+            )
         {
             return Err(Error::CongestionControl);
         }
@@ -254,7 +259,7 @@ async fn serve_connection(
     } else {
         CongestionKind::Bbr
     };
-    let advertised_receive = if congestion == CongestionKind::Bbr {
+    let advertised_receive = if bandwidth.ignore_client_bandwidth {
         CongestionReceive::Auto
     } else {
         CongestionReceive::Rate(bandwidth.receive_bps)
@@ -275,6 +280,29 @@ async fn serve_connection(
         .await
         .map_err(|error| Error::Http3(error.to_string()))?;
     let user = user.expect("authenticated request has a user");
+    tracing::info!(
+        %source,
+        %user,
+        ?congestion,
+        configured_send_bps = bandwidth.send_bps,
+        configured_receive_bps = bandwidth.receive_bps,
+        client_receive = ?client_receive,
+        "Hysteria2 server congestion negotiated"
+    );
+    let _metrics_task = bandwidth
+        .brutal_debug
+        .then(|| ConnectionMetricsTask::spawn(connection.clone(), "server", source, congestion));
+    let _window_task = AdaptiveWindowTask::spawn(
+        connection.clone(),
+        send_rate.unwrap_or_default(),
+        if bandwidth.ignore_client_bandwidth {
+            0
+        } else {
+            bandwidth.receive_bps
+        },
+        super::transport::SEND_WINDOW,
+        u64::from(super::transport::CONNECTION_RECEIVE_WINDOW),
+    );
 
     // Keep the HTTP/3 state alive while raw Hysteria2 streams use the same
     // Quinn connection. The h3 connection is intentionally no longer polled,
@@ -409,13 +437,9 @@ async fn handle_stream(
 ) -> Result<()> {
     let destination = read_tcp_request(&mut recv).await?;
     write_tcp_response(&mut send, Ok(())).await?;
-    let (application, bridge) = tokio::io::duplex(BRIDGE_CAPACITY);
-    let (bridge_read, bridge_write) = tokio::io::split(bridge);
-    spawn_encode(bridge_read, send);
-    spawn_decode(recv, bridge_write);
     accepted_sender
         .send(Accepted {
-            stream: application,
+            stream: Hysteria2Stream::new(send, recv),
             destination,
             user,
             source,
@@ -429,9 +453,6 @@ fn negotiated_send_rate(
     bandwidth: ServerBandwidth,
     client_receive: CongestionReceive,
 ) -> Option<u64> {
-    if bandwidth.receive_bps == 0 && bandwidth.ignore_client_bandwidth {
-        return None;
-    }
     let CongestionReceive::Rate(client_receive_bps) = client_receive else {
         return None;
     };
@@ -447,54 +468,6 @@ fn negotiated_send_rate(
     )
 }
 
-fn server_rejects_bbr_client(
-    bandwidth: ServerBandwidth,
-    client_receive: CongestionReceive,
-) -> bool {
-    bandwidth.ignore_client_bandwidth
-        && bandwidth.receive_bps > 0
-        && !matches!(client_receive, CongestionReceive::Rate(rate) if rate > 0)
-}
-
-fn spawn_encode(mut source: ReadHalf<DuplexStream>, mut destination: quinn::SendStream) {
-    tokio::spawn(async move {
-        let mut buffer = vec![0u8; 32 * 1024];
-        loop {
-            match source.read(&mut buffer).await {
-                Ok(0) => {
-                    let _ = destination.shutdown().await;
-                    break;
-                }
-                Ok(length) => {
-                    if destination.write_all(&buffer[..length]).await.is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-}
-
-fn spawn_decode(mut source: quinn::RecvStream, mut destination: WriteHalf<DuplexStream>) {
-    tokio::spawn(async move {
-        let mut buffer = vec![0u8; 32 * 1024];
-        loop {
-            match source.read(&mut buffer).await {
-                Ok(Some(length)) => {
-                    if destination.write_all(&buffer[..length]).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(None) | Err(_) => {
-                    let _ = destination.shutdown().await;
-                    break;
-                }
-            }
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,7 +476,10 @@ mod tests {
     use quinn::{ClientConfig, Endpoint, crypto::rustls::QuicClientConfig};
     use rcgen::generate_simple_self_signed;
     use rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::{
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        time::Duration,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     struct TestMasquerade;
@@ -623,8 +599,10 @@ mod tests {
             async move {
                 for _ in 0..2 {
                     let accepted = server.accept().await.unwrap();
-                    let (mut read, mut write) = tokio::io::split(accepted.stream);
-                    tokio::io::copy(&mut read, &mut write).await.unwrap();
+                    tokio::spawn(async move {
+                        let (mut read, mut write) = tokio::io::split(accepted.stream);
+                        let _ = tokio::io::copy(&mut read, &mut write).await;
+                    });
                 }
             }
         });
@@ -676,6 +654,7 @@ mod tests {
                     send_bps: 3_000_000,
                     receive_bps: 0,
                     ignore_client_bandwidth: true,
+                    ..ServerBandwidth::default()
                 },
             )
             .unwrap(),
@@ -704,6 +683,7 @@ mod tests {
             ClientBandwidth {
                 send_bps: 1_000_000,
                 receive_bps: 2_000_000,
+                ..ClientBandwidth::default()
             },
         )
         .unwrap();
@@ -723,7 +703,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn negotiates_brutal_rates_in_both_directions() {
+    async fn negotiates_asymmetric_brutal_rates_in_both_directions() {
         let certificate = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let certificate_der = certificate.cert.der().to_vec();
         let private_key = certificate.signing_key.serialize_der();
@@ -739,9 +719,10 @@ mod tests {
                     }],
                 },
                 ServerBandwidth {
-                    send_bps: 3_000_000,
-                    receive_bps: 4_000_000,
+                    send_bps: 125_000_000,
+                    receive_bps: 125_000_000,
                     ignore_client_bandwidth: false,
+                    ..ServerBandwidth::default()
                 },
             )
             .unwrap(),
@@ -753,7 +734,7 @@ mod tests {
                 assert_eq!(
                     accepted.congestion,
                     CongestionKind::Brutal {
-                        bytes_per_second: 2_000_000
+                        bytes_per_second: 12_500_000
                     }
                 );
                 let (mut read, mut write) = tokio::io::split(accepted.stream);
@@ -768,8 +749,9 @@ mod tests {
                 ca_certificates: vec![certificate_der],
             },
             ClientBandwidth {
-                send_bps: 1_000_000,
-                receive_bps: 2_000_000,
+                send_bps: 3_750_000,
+                receive_bps: 12_500_000,
+                ..ClientBandwidth::default()
             },
         )
         .unwrap();
@@ -780,13 +762,18 @@ mod tests {
         assert_eq!(
             client.congestion_kind().await,
             Some(CongestionKind::Brutal {
-                bytes_per_second: 1_000_000
+                bytes_per_second: 3_750_000
             })
         );
-        stream.write_all(b"brutal negotiation").await.unwrap();
-        let mut response = [0u8; 18];
-        stream.read_exact(&mut response).await.unwrap();
-        assert_eq!(&response, b"brutal negotiation");
+        let payload = vec![0x5a; 4 * 1024 * 1024];
+        let mut response = vec![0; payload.len()];
+        tokio::time::timeout(Duration::from_secs(10), async {
+            stream.write_all(&payload).await.unwrap();
+            stream.read_exact(&mut response).await.unwrap();
+        })
+        .await
+        .expect("30 Mbps Brutal transfer exceeded its throughput budget");
+        assert_eq!(response, payload);
         stream.shutdown().await.unwrap();
         server_task.await.unwrap();
         client.close();
@@ -830,26 +817,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_server_can_reject_bbr_clients() {
+    async fn ignore_client_bandwidth_forces_bbr_without_rejecting_client() {
         let certificate = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let certificate_der = certificate.cert.der().to_vec();
-        let server = Server::bind_with_bandwidth(
-            ServerOptions {
-                listen: "127.0.0.1:0".parse().unwrap(),
-                certificate_chain: vec![certificate_der.clone()],
-                private_key: certificate.signing_key.serialize_der(),
-                users: vec![User {
-                    name: "alice".into(),
-                    password: "secret".into(),
-                }],
-            },
-            ServerBandwidth {
-                send_bps: 1_000_000,
-                receive_bps: 1_000_000,
-                ignore_client_bandwidth: true,
-            },
-        )
-        .unwrap();
+        let server = Arc::new(
+            Server::bind_with_bandwidth(
+                ServerOptions {
+                    listen: "127.0.0.1:0".parse().unwrap(),
+                    certificate_chain: vec![certificate_der.clone()],
+                    private_key: certificate.signing_key.serialize_der(),
+                    users: vec![User {
+                        name: "alice".into(),
+                        password: "secret".into(),
+                    }],
+                },
+                ServerBandwidth {
+                    send_bps: 1_000_000,
+                    receive_bps: 1_000_000,
+                    ignore_client_bandwidth: true,
+                    ..ServerBandwidth::default()
+                },
+            )
+            .unwrap(),
+        );
+        let server_task = tokio::spawn({
+            let server = Arc::clone(&server);
+            async move {
+                let accepted = server.accept().await.unwrap();
+                assert_eq!(accepted.congestion, CongestionKind::Bbr);
+                let (mut read, mut write) = tokio::io::split(accepted.stream);
+                tokio::io::copy(&mut read, &mut write).await.unwrap();
+            }
+        });
         let client = Client::new(ClientOptions {
             server: server.local_addr().unwrap(),
             server_name: "localhost".into(),
@@ -857,17 +856,17 @@ mod tests {
             ca_certificates: vec![certificate_der],
         })
         .unwrap();
-        let error = match client
+        let mut stream = client
             .connect(Address::new("example.com", 443).unwrap())
             .await
-        {
-            Ok(_) => panic!("BBR client unexpectedly authenticated"),
-            Err(error) => error,
-        };
-        assert!(
-            matches!(error, Error::AuthenticationFailed(404)),
-            "unexpected authentication error: {error:?}"
-        );
+            .unwrap();
+        assert_eq!(client.congestion_kind().await, Some(CongestionKind::Bbr));
+        stream.write_all(b"configured BBR").await.unwrap();
+        let mut response = [0u8; 14];
+        stream.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"configured BBR");
+        stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
         client.close();
         server.close().await;
     }
