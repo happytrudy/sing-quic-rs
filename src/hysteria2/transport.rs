@@ -16,7 +16,13 @@ pub(crate) const SEND_WINDOW: u64 = 20 * 1024 * 1024;
 pub(crate) const UDP_SOCKET_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 pub(crate) const DATAGRAM_BUFFER_SIZE: usize = 2_500_000;
 
-pub(crate) fn base_transport_config() -> TransportConfig {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct QuicTransportOptions {
+    pub initial_packet_size: u16,
+    pub disable_path_mtu_discovery: bool,
+}
+
+pub(crate) fn base_transport_config(options: QuicTransportOptions) -> TransportConfig {
     let mut transport = TransportConfig::default();
     transport
         .congestion_controller_factory(Arc::new(SwitchableCongestionFactory))
@@ -27,6 +33,12 @@ pub(crate) fn base_transport_config() -> TransportConfig {
         .datagram_send_buffer_size(DATAGRAM_BUFFER_SIZE)
         .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()))
         .keep_alive_interval(Some(Duration::from_secs(10)));
+    if options.initial_packet_size > 0 {
+        transport.initial_mtu(options.initial_packet_size);
+    }
+    if options.disable_path_mtu_discovery {
+        transport.mtu_discovery_config(None);
+    }
     transport
 }
 
@@ -84,7 +96,11 @@ mod tests {
     fn uses_adaptive_hysteria2_flow_control_windows() {
         assert_eq!(CONNECTION_RECEIVE_WINDOW, 20_971_520);
         assert!(SEND_WINDOW >= u64::from(CONNECTION_RECEIVE_WINDOW));
-        let _ = base_transport_config();
+        let _ = base_transport_config(QuicTransportOptions::default());
+        let _ = base_transport_config(QuicTransportOptions {
+            initial_packet_size: 1200,
+            disable_path_mtu_discovery: true,
+        });
     }
 
     #[tokio::test]

@@ -10,6 +10,7 @@ pub use client::{Client, ClientOptions};
 pub use packet::{Hysteria2Packet, Hysteria2PacketConnection};
 pub use server::{Accepted, MasqueradeHandler, Server, ServerOptions, User};
 pub use stream::Hysteria2Stream;
+pub use transport::QuicTransportOptions;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ClientBandwidth {

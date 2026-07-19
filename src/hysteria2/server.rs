@@ -30,7 +30,7 @@ use super::{
     Hysteria2PacketConnection, Hysteria2Stream, ServerBandwidth,
     metrics::ConnectionMetricsTask,
     packet::decode_message,
-    transport::{base_transport_config, bind_endpoint},
+    transport::{QuicTransportOptions, base_transport_config, bind_endpoint},
 };
 
 const ALPN_H3: &[u8] = b"h3";
@@ -84,6 +84,7 @@ pub enum Accepted {
 
 pub struct Server {
     endpoint: Endpoint,
+    transport_options: QuicTransportOptions,
     incoming: Mutex<mpsc::Receiver<Accepted>>,
     accept_task: tokio::task::JoinHandle<()>,
 }
@@ -102,7 +103,25 @@ impl Server {
         bandwidth: ServerBandwidth,
         masquerade: Option<Arc<dyn MasqueradeHandler>>,
     ) -> Result<Self> {
-        let server_config = build_server_config(options.certificate_chain, options.private_key)?;
+        Self::bind_with_bandwidth_and_transport_and_masquerade(
+            options,
+            bandwidth,
+            QuicTransportOptions::default(),
+            masquerade,
+        )
+    }
+
+    pub fn bind_with_bandwidth_and_transport_and_masquerade(
+        options: ServerOptions,
+        bandwidth: ServerBandwidth,
+        transport_options: QuicTransportOptions,
+        masquerade: Option<Arc<dyn MasqueradeHandler>>,
+    ) -> Result<Self> {
+        let server_config = build_server_config(
+            options.certificate_chain,
+            options.private_key,
+            transport_options,
+        )?;
         let endpoint = bind_endpoint(options.listen, Some(server_config))?;
         let users = Arc::new(
             options
@@ -149,6 +168,7 @@ impl Server {
         });
         Ok(Self {
             endpoint,
+            transport_options,
             incoming: Mutex::new(receiver),
             accept_task,
         })
@@ -167,8 +187,11 @@ impl Server {
         certificate_chain: Vec<Vec<u8>>,
         private_key: Vec<u8>,
     ) -> Result<()> {
-        self.endpoint
-            .set_server_config(Some(build_server_config(certificate_chain, private_key)?));
+        self.endpoint.set_server_config(Some(build_server_config(
+            certificate_chain,
+            private_key,
+            self.transport_options,
+        )?));
         Ok(())
     }
 
@@ -182,6 +205,7 @@ impl Server {
 fn build_server_config(
     certificate_chain: Vec<Vec<u8>>,
     private_key: Vec<u8>,
+    transport_options: QuicTransportOptions,
 ) -> Result<ServerConfig> {
     let certificates = certificate_chain
         .into_iter()
@@ -194,7 +218,7 @@ fn build_server_config(
     tls.alpn_protocols = vec![ALPN_H3.to_vec()];
     let crypto =
         QuicServerConfig::try_from(tls).map_err(|error| Error::QuicTls(error.to_string()))?;
-    let mut transport = base_transport_config();
+    let mut transport = base_transport_config(transport_options);
     transport.max_concurrent_bidi_streams(1024u32.into());
     let mut server_config = ServerConfig::with_crypto(Arc::new(crypto));
     server_config.transport_config(Arc::new(transport));
@@ -317,6 +341,7 @@ async fn serve_connection(
         configured_send_bps = bandwidth.send_bps,
         configured_receive_bps = bandwidth.receive_bps,
         client_receive = ?client_receive,
+        negotiated_send_bps = send_rate.unwrap_or_default(),
         "Hysteria2 server congestion negotiated"
     );
     let _metrics_task = bandwidth
@@ -774,7 +799,7 @@ mod tests {
         let certificate_der = certificate.cert.der().to_vec();
         let private_key = certificate.signing_key.serialize_der();
         let server = Arc::new(
-            Server::bind_with_bandwidth(
+            Server::bind_with_bandwidth_and_transport_and_masquerade(
                 ServerOptions {
                     listen: "127.0.0.1:0".parse().unwrap(),
                     certificate_chain: vec![certificate_der.clone()],
@@ -790,6 +815,11 @@ mod tests {
                     ignore_client_bandwidth: false,
                     ..ServerBandwidth::default()
                 },
+                QuicTransportOptions {
+                    initial_packet_size: 1200,
+                    disable_path_mtu_discovery: true,
+                },
+                None,
             )
             .unwrap(),
         );
@@ -809,7 +839,7 @@ mod tests {
                 tokio::io::copy(&mut read, &mut write).await.unwrap();
             }
         });
-        let client = Client::new_with_bandwidth(
+        let client = Client::new_with_bandwidth_and_transport(
             ClientOptions {
                 server: server.local_addr().unwrap(),
                 server_name: "localhost".into(),
@@ -820,6 +850,10 @@ mod tests {
                 send_bps: 3_750_000,
                 receive_bps: 12_500_000,
                 ..ClientBandwidth::default()
+            },
+            QuicTransportOptions {
+                initial_packet_size: 1200,
+                disable_path_mtu_discovery: true,
             },
         )
         .unwrap();
@@ -832,6 +866,16 @@ mod tests {
             Some(CongestionKind::Brutal {
                 bytes_per_second: 3_750_000
             })
+        );
+        assert_eq!(
+            client
+                .connection_handle()
+                .await
+                .unwrap()
+                .stats()
+                .path
+                .current_mtu,
+            1200
         );
         let payload = vec![0x5a; 4 * 1024 * 1024];
         let mut response = vec![0; payload.len()];

@@ -22,7 +22,7 @@ use super::protocol::{
 use super::{
     ClientBandwidth, Hysteria2Stream,
     metrics::ConnectionMetricsTask,
-    transport::{base_transport_config, bind_endpoint},
+    transport::{QuicTransportOptions, base_transport_config, bind_endpoint},
 };
 
 const ALPN_H3: &[u8] = b"h3";
@@ -63,6 +63,14 @@ impl Client {
     }
 
     pub fn new_with_bandwidth(options: ClientOptions, bandwidth: ClientBandwidth) -> Result<Self> {
+        Self::new_with_bandwidth_and_transport(options, bandwidth, QuicTransportOptions::default())
+    }
+
+    pub fn new_with_bandwidth_and_transport(
+        options: ClientOptions,
+        bandwidth: ClientBandwidth,
+        transport_options: QuicTransportOptions,
+    ) -> Result<Self> {
         if options.server_name.is_empty() {
             return Err(Error::InvalidServerName(options.server_name));
         }
@@ -76,7 +84,7 @@ impl Client {
         tls.alpn_protocols = vec![ALPN_H3.to_vec()];
         let crypto =
             QuicClientConfig::try_from(tls).map_err(|error| Error::QuicTls(error.to_string()))?;
-        let transport = base_transport_config();
+        let transport = base_transport_config(transport_options);
         let mut client_config = ClientConfig::new(Arc::new(crypto));
         client_config.transport_config(Arc::new(transport));
 
@@ -206,6 +214,8 @@ async fn authenticate(
         ?congestion,
         configured_send_bps = bandwidth.send_bps,
         configured_receive_bps = bandwidth.receive_bps,
+        remote_receive = ?remote_receive,
+        negotiated_send_bps = send_rate.unwrap_or_default(),
         "Hysteria2 client congestion negotiated"
     );
 

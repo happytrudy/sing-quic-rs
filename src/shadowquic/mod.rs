@@ -331,7 +331,7 @@ fn apply_congestion(connection: &quinn::Connection, congestion: CongestionConfig
 }
 
 fn shadowquic_transport_config() -> TransportConfig {
-    let mut transport = base_transport_config();
+    let mut transport = base_transport_config(Default::default());
     transport
         .max_concurrent_bidi_streams(VarInt::from_u32(MAX_CONCURRENT_STREAMS))
         .max_concurrent_uni_streams(VarInt::from_u32(MAX_CONCURRENT_STREAMS))
