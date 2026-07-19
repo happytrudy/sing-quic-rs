@@ -134,6 +134,11 @@ impl Client {
             .as_ref()
             .map(|connection| connection.congestion)
     }
+
+    #[cfg(test)]
+    pub(crate) async fn connection_handle(&self) -> Result<quinn::Connection> {
+        Ok(self.connection().await?.connection.clone())
+    }
 }
 
 async fn authenticate(

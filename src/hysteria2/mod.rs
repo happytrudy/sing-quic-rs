@@ -1,11 +1,13 @@
 mod client;
 mod metrics;
+mod packet;
 mod protocol;
 mod server;
 mod stream;
 pub(crate) mod transport;
 
 pub use client::{Client, ClientOptions};
+pub use packet::{Hysteria2Packet, Hysteria2PacketConnection};
 pub use server::{Accepted, MasqueradeHandler, Server, ServerOptions, User};
 pub use stream::Hysteria2Stream;
 

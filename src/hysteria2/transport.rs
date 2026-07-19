@@ -14,6 +14,7 @@ use quinn::{Endpoint, EndpointConfig, ServerConfig, TokioRuntime, TransportConfi
 pub(crate) const CONNECTION_RECEIVE_WINDOW: u32 = 20 * 1024 * 1024;
 pub(crate) const SEND_WINDOW: u64 = 20 * 1024 * 1024;
 pub(crate) const UDP_SOCKET_BUFFER_SIZE: usize = 16 * 1024 * 1024;
+pub(crate) const DATAGRAM_BUFFER_SIZE: usize = 2_500_000;
 
 pub(crate) fn base_transport_config() -> TransportConfig {
     let mut transport = TransportConfig::default();
@@ -22,6 +23,8 @@ pub(crate) fn base_transport_config() -> TransportConfig {
         .stream_receive_window(VarInt::MAX)
         .receive_window(VarInt::from_u32(CONNECTION_RECEIVE_WINDOW))
         .send_window(SEND_WINDOW)
+        .datagram_receive_buffer_size(Some(DATAGRAM_BUFFER_SIZE))
+        .datagram_send_buffer_size(DATAGRAM_BUFFER_SIZE)
         .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()))
         .keep_alive_interval(Some(Duration::from_secs(10)));
     transport

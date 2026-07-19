@@ -27,8 +27,9 @@ use super::protocol::{
     read_tcp_request, write_tcp_response,
 };
 use super::{
-    Hysteria2Stream, ServerBandwidth,
+    Hysteria2PacketConnection, Hysteria2Stream, ServerBandwidth,
     metrics::ConnectionMetricsTask,
+    packet::decode_message,
     transport::{base_transport_config, bind_endpoint},
 };
 
@@ -58,12 +59,27 @@ pub trait MasqueradeHandler: Send + Sync + 'static {
 }
 
 #[derive(Debug)]
-pub struct Accepted {
+pub struct AcceptedStream {
     pub stream: Hysteria2Stream,
     pub destination: Address,
     pub user: String,
     pub source: SocketAddr,
     pub congestion: CongestionKind,
+}
+
+#[derive(Debug)]
+pub struct AcceptedPacket {
+    pub connection: Arc<Hysteria2PacketConnection>,
+    pub destination: Address,
+    pub user: String,
+    pub source: SocketAddr,
+    pub congestion: CongestionKind,
+}
+
+#[derive(Debug)]
+pub enum Accepted {
+    Stream(AcceptedStream),
+    Packet(AcceptedPacket),
 }
 
 pub struct Server {
@@ -105,11 +121,25 @@ impl Server {
                 tokio::spawn(async move {
                     match incoming.await {
                         Ok(connection) => {
+                            let observed_connection = connection.clone();
                             if let Err(error) =
                                 serve_connection(connection, users, sender, bandwidth, masquerade)
                                     .await
                             {
-                                tracing::debug!(%error, "Hysteria2 connection closed");
+                                let stats = observed_connection.stats();
+                                tracing::warn!(
+                                    %error,
+                                    error_debug = ?error,
+                                    close_reason = ?observed_connection.close_reason(),
+                                    peer = %observed_connection.remote_address(),
+                                    rtt_ms = stats.path.rtt.as_secs_f64() * 1_000.0,
+                                    cwnd_bytes = stats.path.cwnd,
+                                    mtu = stats.path.current_mtu,
+                                    sent_packets = stats.path.sent_packets,
+                                    lost_packets = stats.path.lost_packets,
+                                    lost_bytes = stats.path.lost_bytes,
+                                    "Hysteria2 connection closed unexpectedly"
+                                );
                             }
                         }
                         Err(error) => tracing::debug!(%error, "QUIC handshake failed"),
@@ -266,7 +296,7 @@ async fn serve_connection(
     };
     let response = Response::builder()
         .status(StatusCode::from_u16(STATUS_AUTH_OK).expect("valid custom status"))
-        .header(HEADER_UDP, "false")
+        .header(HEADER_UDP, "true")
         .header(HEADER_CC_RX, congestion_receive_value(advertised_receive))
         .header(HEADER_PADDING, padding(256, 2048))
         .body(())
@@ -308,15 +338,45 @@ async fn serve_connection(
     // Quinn connection. The h3 connection is intentionally no longer polled,
     // so it cannot race with the raw bidirectional stream accept loop.
     let _h3_connection = h3_connection;
+    let mut udp_sessions = HashMap::<u32, Arc<Hysteria2PacketConnection>>::new();
     loop {
-        let (send, recv) = connection.accept_bi().await?;
-        let sender = sender.clone();
-        let user = user.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle_stream(send, recv, source, user, congestion, sender).await {
-                tracing::debug!(%error, "Hysteria2 stream closed");
+        tokio::select! {
+            stream = connection.accept_bi() => {
+                let (send, recv) = stream?;
+                let sender = sender.clone();
+                let user = user.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = handle_stream(send, recv, source, user, congestion, sender).await {
+                        tracing::debug!(%error, "Hysteria2 stream closed");
+                    }
+                });
             }
-        });
+            datagram = connection.read_datagram() => {
+                let message = decode_message(&datagram?)?;
+                let packet_connection = match udp_sessions.get(&message.session_id) {
+                    Some(connection) => Arc::clone(connection),
+                    None => {
+                        let packet_connection = Hysteria2PacketConnection::new(
+                            connection.clone(),
+                            message.session_id,
+                        );
+                        sender
+                            .send(Accepted::Packet(AcceptedPacket {
+                                connection: Arc::clone(&packet_connection),
+                                destination: message.destination.clone(),
+                                user: user.clone(),
+                                source,
+                                congestion,
+                            }))
+                            .await
+                            .map_err(|_| Error::Closed)?;
+                        udp_sessions.insert(message.session_id, Arc::clone(&packet_connection));
+                        packet_connection
+                    }
+                };
+                packet_connection.input(message).await?;
+            }
+        }
     }
 }
 
@@ -438,13 +498,13 @@ async fn handle_stream(
     let destination = read_tcp_request(&mut recv).await?;
     write_tcp_response(&mut send, Ok(())).await?;
     accepted_sender
-        .send(Accepted {
+        .send(Accepted::Stream(AcceptedStream {
             stream: Hysteria2Stream::new(send, recv),
             destination,
             user,
             source,
             congestion,
-        })
+        }))
         .await
         .map_err(|_| Error::Closed)
 }
@@ -471,7 +531,9 @@ fn negotiated_send_rate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hysteria2::{Client, ClientBandwidth, ClientOptions};
+    use crate::hysteria2::{
+        Client, ClientBandwidth, ClientOptions, Hysteria2Packet, Hysteria2PacketConnection,
+    };
     use futures::future::poll_fn;
     use quinn::{ClientConfig, Endpoint, crypto::rustls::QuicClientConfig};
     use rcgen::generate_simple_self_signed;
@@ -598,7 +660,9 @@ mod tests {
             let server = Arc::clone(&server);
             async move {
                 for _ in 0..2 {
-                    let accepted = server.accept().await.unwrap();
+                    let Accepted::Stream(accepted) = server.accept().await.unwrap() else {
+                        panic!("expected Hysteria2 TCP stream");
+                    };
                     tokio::spawn(async move {
                         let (mut read, mut write) = tokio::io::split(accepted.stream);
                         let _ = tokio::io::copy(&mut read, &mut write).await;
@@ -662,7 +726,9 @@ mod tests {
         let server_task = tokio::spawn({
             let server = Arc::clone(&server);
             async move {
-                let accepted = server.accept().await.unwrap();
+                let Accepted::Stream(accepted) = server.accept().await.unwrap() else {
+                    panic!("expected Hysteria2 TCP stream");
+                };
                 assert_eq!(accepted.user, "alice");
                 assert_eq!(accepted.congestion, CongestionKind::Bbr);
                 assert_eq!(
@@ -730,7 +796,9 @@ mod tests {
         let server_task = tokio::spawn({
             let server = Arc::clone(&server);
             async move {
-                let accepted = server.accept().await.unwrap();
+                let Accepted::Stream(accepted) = server.accept().await.unwrap() else {
+                    panic!("expected Hysteria2 TCP stream");
+                };
                 assert_eq!(
                     accepted.congestion,
                     CongestionKind::Brutal {
@@ -775,6 +843,73 @@ mod tests {
         .expect("30 Mbps Brutal transfer exceeded its throughput budget");
         assert_eq!(response, payload);
         stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+        client.close();
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn official_udp_datagram_fragmentation_round_trip() {
+        let certificate = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certificate_der = certificate.cert.der().to_vec();
+        let server = Arc::new(
+            Server::bind(ServerOptions {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                certificate_chain: vec![certificate_der.clone()],
+                private_key: certificate.signing_key.serialize_der(),
+                users: vec![User {
+                    name: "alice".into(),
+                    password: "secret".into(),
+                }],
+            })
+            .unwrap(),
+        );
+        let server_task = tokio::spawn({
+            let server = Arc::clone(&server);
+            async move {
+                let Accepted::Packet(accepted) = server.accept().await.unwrap() else {
+                    panic!("expected Hysteria2 UDP session");
+                };
+                assert_eq!(accepted.user, "alice");
+                assert_eq!(accepted.destination, Address::new("1.1.1.1", 53).unwrap());
+                let packet = accepted.connection.recv().await.unwrap();
+                assert_eq!(packet.destination, Address::new("1.1.1.1", 53).unwrap());
+                assert_eq!(packet.data, vec![0x5a; 4096]);
+                accepted
+                    .connection
+                    .send(Hysteria2Packet {
+                        data: b"reply".to_vec(),
+                        destination: Address::new("8.8.8.8", 53).unwrap(),
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+        let client = Client::new(ClientOptions {
+            server: server.local_addr().unwrap(),
+            server_name: "localhost".into(),
+            password: "secret".into(),
+            ca_certificates: vec![certificate_der],
+        })
+        .unwrap();
+        let connection = client.connection_handle().await.unwrap();
+        let packet_connection = Hysteria2PacketConnection::new(connection.clone(), 9);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            packet_connection
+                .send(Hysteria2Packet {
+                    data: vec![0x5a; 4096],
+                    destination: Address::new("1.1.1.1", 53).unwrap(),
+                })
+                .await
+                .unwrap();
+            let message = decode_message(&connection.read_datagram().await.unwrap()).unwrap();
+            packet_connection.input(message).await.unwrap();
+            let response = packet_connection.recv().await.unwrap();
+            assert_eq!(response.destination, Address::new("8.8.8.8", 53).unwrap());
+            assert_eq!(response.data, b"reply");
+        })
+        .await
+        .expect("Hysteria2 UDP round trip timed out");
         server_task.await.unwrap();
         client.close();
         server.close().await;
@@ -843,7 +978,9 @@ mod tests {
         let server_task = tokio::spawn({
             let server = Arc::clone(&server);
             async move {
-                let accepted = server.accept().await.unwrap();
+                let Accepted::Stream(accepted) = server.accept().await.unwrap() else {
+                    panic!("expected Hysteria2 TCP stream");
+                };
                 assert_eq!(accepted.congestion, CongestionKind::Bbr);
                 let (mut read, mut write) = tokio::io::split(accepted.stream);
                 tokio::io::copy(&mut read, &mut write).await.unwrap();
