@@ -62,13 +62,13 @@ fn tune_udp_socket(socket: &UdpSocket) {
             requested = UDP_SOCKET_BUFFER_SIZE,
             send_buffer,
             receive_buffer,
-            "operating system limited Hysteria2 UDP socket buffers"
+            "operating system limited QUIC UDP socket buffers"
         );
     } else {
         tracing::debug!(
             send_buffer,
             receive_buffer,
-            "configured Hysteria2 UDP socket buffers"
+            "configured QUIC UDP socket buffers"
         );
     }
 }
