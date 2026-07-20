@@ -143,7 +143,7 @@ impl Client {
             IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
         };
-        let mut endpoint = bind_endpoint(bind, None)?;
+        let endpoint = bind_endpoint(bind, None)?;
         endpoint.set_default_client_config(config);
         Ok(Self {
             endpoint,

@@ -614,7 +614,7 @@ mod tests {
             .with_no_client_auth();
         tls.alpn_protocols = vec![ALPN_H3.to_vec()];
         let crypto = QuicClientConfig::try_from(tls).unwrap();
-        let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         endpoint.set_default_client_config(ClientConfig::new(Arc::new(crypto)));
         let connection = endpoint
             .connect(server.local_addr().unwrap(), "localhost")
