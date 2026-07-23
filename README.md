@@ -21,16 +21,20 @@ Implemented:
 - multiplexed TCP streams over one authenticated QUIC connection
 - direct Tokio `AsyncRead + AsyncWrite` streams over Quinn without an
   intermediate copy bridge
-- adaptive QUIC flow control with a 20 MiB baseline and runtime RTT/BDP updates
+- official Hysteria2 8 MiB stream and 20 MiB connection flow-control windows
+- Hysteria2 UDP datagrams, fragmentation, and session reuse
+- SunnyQUIC native TLS authentication and shared SQuic TCP/UDP framing
+- SunnyQUIC BBR and Brutal congestion-control selection
+- SunnyQUIC 64-byte SHA256 credential authentication
+- server-side port rebinding without resetting RTT, MTU, or congestion state
 - 16 MiB UDP socket buffer requests with actual-size diagnostics
 - optional loss compensation and two-second connection metrics
 - endpoint shutdown and connection reuse
 
 Not implemented yet:
 
-- Hysteria2 QUIC datagram UDP protocol and fragmentation
 - Salamander and Gecko packet obfuscation
-- port hopping and realm/NAT traversal
+- client-side port hopping and realm/NAT traversal
 - TUIC v5
 - legacy Hysteria v1
 
@@ -52,11 +56,9 @@ negotiated byte rate divided by the measured ACK rate and allows a burst of the
 greater of ten MTU-sized packets or four milliseconds of traffic. Switching an
 established connection preserves its measured RTT.
 
-The QUIC send and connection receive windows are refreshed once per second.
-They use two bandwidth-delay products of headroom, while the send window also
-stays above twice the active congestion window. Stream credit is governed by
-the adaptive aggregate connection window instead of imposing a second fixed
-per-stream ceiling.
+Hysteria2 uses the upstream 8 MiB per-stream receive window and 20 MiB
+connection receive window. The protocol-independent adaptive window task
+remains available to ShadowQUIC, but is not applied to Hysteria2.
 
 Loss compensation counts acknowledged and lost packets over five one-second
 slots. It starts after 50 samples and applies the upstream 0.8 ACK-rate floor.

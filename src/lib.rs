@@ -7,6 +7,7 @@ pub mod congestion;
 mod error;
 pub mod hysteria2;
 pub mod shadowquic;
+pub mod sunnyquic;
 pub mod transport;
 mod varint;
 

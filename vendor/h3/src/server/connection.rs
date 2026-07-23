@@ -218,10 +218,8 @@ where
     }
 
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    pub(crate) fn poll_control(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), ConnectionError>> {
+    /// Polls and processes all currently available HTTP/3 control frames.
+    pub fn poll_control(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ConnectionError>> {
         while (self.poll_next_control(cx)?).is_ready() {}
         Poll::Pending
     }

@@ -7,10 +7,9 @@ use std::{
 
 use crate::congestion::SwitchableCongestionFactory;
 use quinn::{Endpoint, EndpointConfig, ServerConfig, TokioRuntime, TransportConfig, VarInt};
+use socket2::{Domain, Protocol, Socket, Type};
 
-// Start with the upstream Hysteria2 connection window. Per-stream credit is
-// bounded by this aggregate window so the connection window can grow at
-// runtime without a Quinn-internal stream-window setter.
+pub(crate) const STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 pub(crate) const CONNECTION_RECEIVE_WINDOW: u32 = 20 * 1024 * 1024;
 pub(crate) const SEND_WINDOW: u64 = 20 * 1024 * 1024;
 pub(crate) const UDP_SOCKET_BUFFER_SIZE: usize = 16 * 1024 * 1024;
@@ -26,7 +25,7 @@ pub(crate) fn base_transport_config(options: QuicTransportOptions) -> TransportC
     let mut transport = TransportConfig::default();
     transport
         .congestion_controller_factory(Arc::new(SwitchableCongestionFactory))
-        .stream_receive_window(VarInt::MAX)
+        .stream_receive_window(VarInt::from_u32(STREAM_RECEIVE_WINDOW))
         .receive_window(VarInt::from_u32(CONNECTION_RECEIVE_WINDOW))
         .send_window(SEND_WINDOW)
         .datagram_receive_buffer_size(Some(DATAGRAM_BUFFER_SIZE))
@@ -46,7 +45,7 @@ pub(crate) fn bind_endpoint(
     address: SocketAddr,
     server_config: Option<ServerConfig>,
 ) -> io::Result<Endpoint> {
-    let socket = UdpSocket::bind(address)?;
+    let socket = bind_udp_socket(address)?;
     tune_udp_socket(&socket);
     Endpoint::new(
         EndpointConfig::default(),
@@ -54,6 +53,21 @@ pub(crate) fn bind_endpoint(
         socket,
         Arc::new(TokioRuntime),
     )
+}
+
+fn bind_udp_socket(address: SocketAddr) -> io::Result<UdpSocket> {
+    let socket = Socket::new(
+        Domain::for_address(address),
+        Type::DGRAM,
+        Some(Protocol::UDP),
+    )?;
+    if address.is_ipv6()
+        && let Err(error) = socket.set_only_v6(false)
+    {
+        tracing::debug!(%error, "unable to make QUIC UDP socket dual-stack");
+    }
+    socket.bind(&address.into())?;
+    Ok(socket.into())
 }
 
 fn tune_udp_socket(socket: &UdpSocket) {
@@ -93,7 +107,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uses_adaptive_hysteria2_flow_control_windows() {
+    fn uses_official_hysteria2_flow_control_windows() {
+        assert_eq!(STREAM_RECEIVE_WINDOW, 8_388_608);
         assert_eq!(CONNECTION_RECEIVE_WINDOW, 20_971_520);
         assert!(SEND_WINDOW >= u64::from(CONNECTION_RECEIVE_WINDOW));
         let _ = base_transport_config(QuicTransportOptions::default());
@@ -108,5 +123,12 @@ mod tests {
         let endpoint = bind_endpoint("127.0.0.1:0".parse().unwrap(), None).unwrap();
         assert_ne!(endpoint.local_addr().unwrap().port(), 0);
         endpoint.close(0u32.into(), b"test complete");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ipv6_unspecified_socket_is_explicitly_dual_stack() {
+        let socket = bind_udp_socket("[::]:0".parse().unwrap()).unwrap();
+        assert!(!socket2::SockRef::from(&socket).only_v6().unwrap());
     }
 }

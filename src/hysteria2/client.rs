@@ -12,7 +12,6 @@ use tokio::sync::Mutex;
 use crate::congestion::{
     CongestionKind, configure_connection_brutal_with_options, connection_congestion_kind,
 };
-use crate::transport::AdaptiveWindowTask;
 use crate::{Address, Error, Result};
 
 use super::protocol::{
@@ -46,7 +45,6 @@ struct ClientConnection {
     connection: quinn::Connection,
     congestion: CongestionKind,
     h3_driver: tokio::task::JoinHandle<()>,
-    _window_task: AdaptiveWindowTask,
     _metrics_task: Option<ConnectionMetricsTask>,
 }
 
@@ -147,6 +145,12 @@ impl Client {
     pub(crate) async fn connection_handle(&self) -> Result<quinn::Connection> {
         Ok(self.connection().await?.connection.clone())
     }
+
+    #[cfg(test)]
+    pub(crate) fn rebind(&self, socket: std::net::UdpSocket) -> Result<()> {
+        self.endpoint.rebind(socket)?;
+        Ok(())
+    }
 }
 
 async fn authenticate(
@@ -202,13 +206,6 @@ async fn authenticate(
         return Err(Error::CongestionControl);
     }
     let congestion = connection_congestion_kind(&connection).ok_or(Error::CongestionControl)?;
-    let window_task = AdaptiveWindowTask::spawn(
-        connection.clone(),
-        send_rate.unwrap_or_default(),
-        bandwidth.receive_bps,
-        super::transport::SEND_WINDOW,
-        u64::from(super::transport::CONNECTION_RECEIVE_WINDOW),
-    );
     tracing::info!(
         remote = %connection.remote_address(),
         ?congestion,
@@ -235,7 +232,6 @@ async fn authenticate(
         connection,
         congestion,
         h3_driver,
-        _window_task: window_task,
         _metrics_task: metrics_task,
     })
 }

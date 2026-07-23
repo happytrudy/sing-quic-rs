@@ -15,7 +15,9 @@ quinn = { version = "0.12", default-features = false, features = ["runtime-tokio
 quinn-proto = { version = "0.12", default-features = false, features = ["jls"] }
 rand = "0.8"
 rcgen = "0.14"
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+socket2 = "0.6"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"

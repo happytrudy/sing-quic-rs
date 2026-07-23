@@ -1,7 +1,11 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, Weak},
+};
 
 use bytes::{Buf, Bytes};
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, poll_fn};
 use http::{
     Request, Response, StatusCode,
     header::{CONNECTION, CONTENT_LENGTH, TRANSFER_ENCODING},
@@ -18,7 +22,6 @@ use tokio::sync::{Mutex, mpsc};
 use crate::congestion::{
     CongestionKind, configure_connection_brutal_with_options, connection_congestion_kind,
 };
-use crate::transport::AdaptiveWindowTask;
 use crate::{Address, Error, Result};
 
 use super::protocol::{
@@ -146,19 +149,26 @@ impl Server {
                                     .await
                             {
                                 let stats = observed_connection.stats();
-                                tracing::warn!(
-                                    %error,
-                                    error_debug = ?error,
-                                    close_reason = ?observed_connection.close_reason(),
-                                    peer = %observed_connection.remote_address(),
-                                    rtt_ms = stats.path.rtt.as_secs_f64() * 1_000.0,
-                                    cwnd_bytes = stats.path.cwnd,
-                                    mtu = stats.path.current_mtu,
-                                    sent_packets = stats.path.sent_packets,
-                                    lost_packets = stats.path.lost_packets,
-                                    lost_bytes = stats.path.lost_bytes,
-                                    "Hysteria2 connection closed unexpectedly"
-                                );
+                                if is_normal_connection_close(&error) {
+                                    tracing::debug!(
+                                        peer = %observed_connection.remote_address(),
+                                        "Hysteria2 connection closed"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        %error,
+                                        error_debug = ?error,
+                                        close_reason = ?observed_connection.close_reason(),
+                                        peer = %observed_connection.remote_address(),
+                                        rtt_ms = stats.path.rtt.as_secs_f64() * 1_000.0,
+                                        cwnd_bytes = stats.path.cwnd,
+                                        mtu = stats.path.current_mtu,
+                                        sent_packets = stats.path.sent_packets,
+                                        lost_packets = stats.path.lost_packets,
+                                        lost_bytes = stats.path.lost_bytes,
+                                        "Hysteria2 connection closed unexpectedly"
+                                    );
+                                }
                             }
                         }
                         Err(error) => tracing::debug!(%error, "QUIC handshake failed"),
@@ -202,6 +212,16 @@ impl Server {
     }
 }
 
+fn is_normal_connection_close(error: &Error) -> bool {
+    match error {
+        Error::Connection(quinn::ConnectionError::LocallyClosed) => true,
+        Error::Connection(quinn::ConnectionError::ApplicationClosed(close)) => {
+            close.error_code == 0u32.into()
+        }
+        _ => false,
+    }
+}
+
 fn build_server_config(
     certificate_chain: Vec<Vec<u8>>,
     private_key: Vec<u8>,
@@ -219,8 +239,11 @@ fn build_server_config(
     let crypto =
         QuicServerConfig::try_from(tls).map_err(|error| Error::QuicTls(error.to_string()))?;
     let mut transport = base_transport_config(transport_options);
-    transport.max_concurrent_bidi_streams(1024u32.into());
+    transport.max_concurrent_bidi_streams(
+        quinn::VarInt::from_u64(1 << 60).expect("official Hysteria2 stream limit"),
+    );
     let mut server_config = ServerConfig::with_crypto(Arc::new(crypto));
+    server_config.disable_path_manager(true);
     server_config.transport_config(Arc::new(transport));
     Ok(server_config)
 }
@@ -294,11 +317,27 @@ async fn serve_connection(
             spawn_masquerade_request(source, request, stream, masquerade.clone());
         }
     }
-    let send_rate = if bandwidth.ignore_client_bandwidth {
-        None
-    } else {
-        negotiated_send_rate(bandwidth, client_receive)
-    };
+    if bandwidth.receive_bps > 0
+        && bandwidth.ignore_client_bandwidth
+        && !matches!(client_receive, CongestionReceive::Rate(rate) if rate > 0)
+    {
+        spawn_masquerade_request(source, request, stream, masquerade.clone());
+        loop {
+            let Some(resolver) = h3_connection
+                .accept()
+                .await
+                .map_err(|error| Error::Http3(error.to_string()))?
+            else {
+                return Ok(());
+            };
+            let (request, stream) = resolver
+                .resolve_request()
+                .await
+                .map_err(|error| Error::Http3(error.to_string()))?;
+            spawn_masquerade_request(source, request, stream, masquerade.clone());
+        }
+    }
+    let send_rate = negotiated_send_rate(bandwidth, client_receive);
     let congestion = if authenticated {
         if let Some(bytes_per_second) = send_rate
             && !configure_connection_brutal_with_options(
@@ -313,11 +352,9 @@ async fn serve_connection(
     } else {
         CongestionKind::Bbr
     };
-    let advertised_receive = if bandwidth.ignore_client_bandwidth {
-        CongestionReceive::Auto
-    } else {
-        CongestionReceive::Rate(bandwidth.receive_bps)
-    };
+    let advertised_receive = send_rate
+        .map(|_| CongestionReceive::Rate(bandwidth.receive_bps))
+        .unwrap_or(CongestionReceive::Auto);
     let response = Response::builder()
         .status(StatusCode::from_u16(STATUS_AUTH_OK).expect("valid custom status"))
         .header(HEADER_UDP, "true")
@@ -347,39 +384,30 @@ async fn serve_connection(
     let _metrics_task = bandwidth
         .brutal_debug
         .then(|| ConnectionMetricsTask::spawn(connection.clone(), "server", source, congestion));
-    let _window_task = AdaptiveWindowTask::spawn(
-        connection.clone(),
-        send_rate.unwrap_or_default(),
-        if bandwidth.ignore_client_bandwidth {
-            0
-        } else {
-            bandwidth.receive_bps
-        },
-        super::transport::SEND_WINDOW,
-        u64::from(super::transport::CONNECTION_RECEIVE_WINDOW),
-    );
-
-    // Keep the HTTP/3 state alive while raw Hysteria2 streams use the same
-    // Quinn connection. The h3 connection is intentionally no longer polled,
-    // so it cannot race with the raw bidirectional stream accept loop.
-    let _h3_connection = h3_connection;
-    let mut udp_sessions = HashMap::<u32, Arc<Hysteria2PacketConnection>>::new();
+    let mut udp_sessions = HashMap::<u32, Weak<Hysteria2PacketConnection>>::new();
     loop {
         tokio::select! {
+            control = poll_fn(|context| h3_connection.poll_control(context)) => {
+                control.map_err(|error| Error::Http3(error.to_string()))?;
+            }
             stream = connection.accept_bi() => {
                 let (send, recv) = stream?;
                 let sender = sender.clone();
                 let user = user.clone();
+                let stream_connection = connection.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = handle_stream(send, recv, source, user, congestion, sender).await {
+                    if let Err(error) = handle_stream(send, recv, stream_connection, user, congestion, sender).await {
                         tracing::debug!(%error, "Hysteria2 stream closed");
                     }
                 });
             }
             datagram = connection.read_datagram() => {
                 let message = decode_message(&datagram?)?;
-                let packet_connection = match udp_sessions.get(&message.session_id) {
-                    Some(connection) => Arc::clone(connection),
+                let packet_connection = match udp_sessions
+                    .get(&message.session_id)
+                    .and_then(Weak::upgrade)
+                {
+                    Some(connection) => connection,
                     None => {
                         let packet_connection = Hysteria2PacketConnection::new(
                             connection.clone(),
@@ -390,12 +418,15 @@ async fn serve_connection(
                                 connection: Arc::clone(&packet_connection),
                                 destination: message.destination.clone(),
                                 user: user.clone(),
-                                source,
+                                source: connection.remote_address(),
                                 congestion,
                             }))
                             .await
                             .map_err(|_| Error::Closed)?;
-                        udp_sessions.insert(message.session_id, Arc::clone(&packet_connection));
+                        udp_sessions.insert(
+                            message.session_id,
+                            Arc::downgrade(&packet_connection),
+                        );
                         packet_connection
                     }
                 };
@@ -515,13 +546,14 @@ where
 async fn handle_stream(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
-    source: SocketAddr,
+    connection: quinn::Connection,
     user: String,
     congestion: CongestionKind,
     accepted_sender: mpsc::Sender<Accepted>,
 ) -> Result<()> {
     let destination = read_tcp_request(&mut recv).await?;
     write_tcp_response(&mut send, Ok(())).await?;
+    let source = connection.remote_address();
     accepted_sender
         .send(Accepted::Stream(AcceptedStream {
             stream: Hysteria2Stream::new(send, recv),
@@ -538,6 +570,9 @@ fn negotiated_send_rate(
     bandwidth: ServerBandwidth,
     client_receive: CongestionReceive,
 ) -> Option<u64> {
+    if bandwidth.receive_bps == 0 && bandwidth.ignore_client_bandwidth {
+        return None;
+    }
     let CongestionReceive::Rate(client_receive_bps) = client_receive else {
         return None;
     };
@@ -568,6 +603,38 @@ mod tests {
         time::Duration,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn matches_official_server_send_rate_negotiation() {
+        let normal = ServerBandwidth {
+            send_bps: 125_000_000,
+            receive_bps: 125_000_000,
+            ..ServerBandwidth::default()
+        };
+        assert_eq!(
+            negotiated_send_rate(normal, CongestionReceive::Rate(12_500_000)),
+            Some(12_500_000)
+        );
+        assert_eq!(
+            negotiated_send_rate(normal, CongestionReceive::Rate(250_000_000)),
+            Some(125_000_000)
+        );
+        assert_eq!(
+            negotiated_send_rate(normal, CongestionReceive::Rate(0)),
+            None
+        );
+
+        let automatic = ServerBandwidth {
+            send_bps: 125_000_000,
+            receive_bps: 0,
+            ignore_client_bandwidth: true,
+            ..ServerBandwidth::default()
+        };
+        assert_eq!(
+            negotiated_send_rate(automatic, CongestionReceive::Rate(12_500_000)),
+            None
+        );
+    }
 
     struct TestMasquerade;
 
@@ -793,6 +860,85 @@ mod tests {
         server.close().await;
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn mapped_ipv4_port_rebind_keeps_connection_usable() {
+        let certificate = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certificate_der = certificate.cert.der().to_vec();
+        let server = Arc::new(
+            Server::bind(ServerOptions {
+                listen: "[::]:0".parse().unwrap(),
+                certificate_chain: vec![certificate_der.clone()],
+                private_key: certificate.signing_key.serialize_der(),
+                users: vec![User {
+                    name: "alice".into(),
+                    password: "secret".into(),
+                }],
+            })
+            .unwrap(),
+        );
+        let server_address = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            server.local_addr().unwrap().port(),
+        );
+        let server_task = tokio::spawn({
+            let server = Arc::clone(&server);
+            async move {
+                let mut first_source = None;
+                for sequence in 0..2 {
+                    let Accepted::Stream(accepted) = server.accept().await.unwrap() else {
+                        panic!("expected Hysteria2 TCP stream");
+                    };
+                    if sequence == 0 {
+                        first_source = Some(accepted.source);
+                    } else {
+                        assert_ne!(accepted.source.port(), first_source.unwrap().port());
+                    }
+                    tokio::spawn(async move {
+                        let (mut read, mut write) = tokio::io::split(accepted.stream);
+                        let _ = tokio::io::copy(&mut read, &mut write).await;
+                    });
+                }
+            }
+        });
+        let client = Client::new(ClientOptions {
+            server: server_address,
+            server_name: "localhost".into(),
+            password: "secret".into(),
+            ca_certificates: vec![certificate_der],
+        })
+        .unwrap();
+
+        let mut first = client
+            .connect(Address::new("example.com", 443).unwrap())
+            .await
+            .unwrap();
+        first.write_all(b"before rebind").await.unwrap();
+        let mut response = [0; 13];
+        first.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"before rebind");
+        first.shutdown().await.unwrap();
+
+        client
+            .rebind(std::net::UdpSocket::bind("0.0.0.0:0").unwrap())
+            .unwrap();
+        let mut second = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.connect(Address::new("example.com", 443).unwrap()),
+        )
+        .await
+        .expect("Hysteria2 stream did not recover after IPv4 port rebind")
+        .unwrap();
+        second.write_all(b"after rebind").await.unwrap();
+        second.read_exact(&mut response[..12]).await.unwrap();
+        assert_eq!(&response[..12], b"after rebind");
+        second.shutdown().await.unwrap();
+
+        server_task.await.unwrap();
+        client.close();
+        server.close().await;
+    }
+
     #[tokio::test]
     async fn negotiates_asymmetric_brutal_rates_in_both_directions() {
         let certificate = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -960,6 +1106,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recreates_udp_session_after_router_releases_it() {
+        let certificate = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certificate_der = certificate.cert.der().to_vec();
+        let server = Arc::new(
+            Server::bind(ServerOptions {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                certificate_chain: vec![certificate_der.clone()],
+                private_key: certificate.signing_key.serialize_der(),
+                users: vec![User {
+                    name: "alice".into(),
+                    password: "secret".into(),
+                }],
+            })
+            .unwrap(),
+        );
+        let (released_sender, mut released_receiver) = mpsc::channel(1);
+        let server_task = tokio::spawn({
+            let server = Arc::clone(&server);
+            async move {
+                for sequence in 0..2 {
+                    let Accepted::Packet(accepted) = server.accept().await.unwrap() else {
+                        panic!("expected Hysteria2 UDP session");
+                    };
+                    let packet = accepted.connection.recv().await.unwrap();
+                    assert_eq!(packet.data, vec![sequence]);
+                    drop(accepted);
+                    released_sender.send(()).await.unwrap();
+                }
+            }
+        });
+        let client = Client::new(ClientOptions {
+            server: server.local_addr().unwrap(),
+            server_name: "localhost".into(),
+            password: "secret".into(),
+            ca_certificates: vec![certificate_der],
+        })
+        .unwrap();
+        let connection = client.connection_handle().await.unwrap();
+        let packet_connection = Hysteria2PacketConnection::new(connection, 9);
+
+        for sequence in 0..2 {
+            packet_connection
+                .send(Hysteria2Packet {
+                    data: vec![sequence],
+                    destination: Address::new("1.1.1.1", 53).unwrap(),
+                })
+                .await
+                .unwrap();
+            released_receiver.recv().await.unwrap();
+        }
+
+        server_task.await.unwrap();
+        client.close();
+        server.close().await;
+    }
+
+    #[tokio::test]
     async fn rejects_invalid_password() {
         let certificate = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let certificate_der = certificate.cert.der().to_vec();
@@ -996,7 +1199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ignore_client_bandwidth_forces_bbr_without_rejecting_client() {
+    async fn ignore_client_bandwidth_rejects_auto_with_fixed_receive_rate() {
         let certificate = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let certificate_der = certificate.cert.der().to_vec();
         let server = Arc::new(
@@ -1019,17 +1222,6 @@ mod tests {
             )
             .unwrap(),
         );
-        let server_task = tokio::spawn({
-            let server = Arc::clone(&server);
-            async move {
-                let Accepted::Stream(accepted) = server.accept().await.unwrap() else {
-                    panic!("expected Hysteria2 TCP stream");
-                };
-                assert_eq!(accepted.congestion, CongestionKind::Bbr);
-                let (mut read, mut write) = tokio::io::split(accepted.stream);
-                tokio::io::copy(&mut read, &mut write).await.unwrap();
-            }
-        });
         let client = Client::new(ClientOptions {
             server: server.local_addr().unwrap(),
             server_name: "localhost".into(),
@@ -1037,17 +1229,11 @@ mod tests {
             ca_certificates: vec![certificate_der],
         })
         .unwrap();
-        let mut stream = client
+        let error = client
             .connect(Address::new("example.com", 443).unwrap())
             .await
-            .unwrap();
-        assert_eq!(client.congestion_kind().await, Some(CongestionKind::Bbr));
-        stream.write_all(b"configured BBR").await.unwrap();
-        let mut response = [0u8; 14];
-        stream.read_exact(&mut response).await.unwrap();
-        assert_eq!(&response, b"configured BBR");
-        stream.shutdown().await.unwrap();
-        server_task.await.unwrap();
+            .unwrap_err();
+        assert!(matches!(error, Error::AuthenticationFailed(404)));
         client.close();
         server.close().await;
     }

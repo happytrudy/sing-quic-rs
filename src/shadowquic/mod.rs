@@ -15,6 +15,7 @@ use std::{
         atomic::{AtomicBool, AtomicU16, Ordering},
     },
     task::{Context, Poll},
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -23,11 +24,13 @@ use quinn::{
 };
 use rustls::{
     ClientConfig as RustlsClientConfig, RootCertStore, ServerConfig as RustlsServerConfig,
-    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    pki_types::{
+        CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
+    },
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
-    sync::{Mutex, Notify, mpsc},
+    sync::{Mutex, Notify, mpsc, watch},
 };
 
 use crate::congestion::{
@@ -41,6 +44,7 @@ use crate::{Address, Error, Result};
 const SQ_CONNECT: u8 = 0x01;
 const SQ_ASSOCIATE_OVER_DATAGRAM: u8 = 0x03;
 const SQ_ASSOCIATE_OVER_STREAM: u8 = 0x04;
+const SQ_AUTHENTICATE: u8 = 0x05;
 const SQ_EXTENSION: u8 = 0xff;
 const SQ_EXTENSION_CONNECTION: u64 = 0x01;
 const SQ_EXTENSION_GET_STATS: u8 = 0x00;
@@ -53,6 +57,8 @@ const DATAGRAM_BUFFER_SIZE: usize = 2_500_000;
 const SHADOWQUIC_INITIAL_MTU: u16 = 1_300;
 const SHADOWQUIC_MIN_MTU: u16 = 1_290;
 const STREAM_ERROR_CODE: u32 = 0x100;
+const SUNNY_AUTH_ERROR_CODE: u32 = 263;
+const SUNNY_AUTH_TIMEOUT: Duration = Duration::from_millis(3_200);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CongestionConfig {
@@ -72,6 +78,28 @@ pub struct ClientOptions {
     pub password: String,
     pub congestion: CongestionConfig,
     pub zero_rtt: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SunnyClientOptions {
+    pub server: SocketAddr,
+    pub server_name: String,
+    pub credential: [u8; 64],
+    pub ca_certificates: Vec<Vec<u8>>,
+    pub congestion: CongestionConfig,
+    pub zero_rtt: bool,
+}
+
+#[derive(Clone, Debug)]
+enum ClientAuthentication {
+    Jls,
+    Sunny { credential: [u8; 64] },
+}
+
+struct ClientConnection {
+    connection: quinn::Connection,
+    incoming_udp: Arc<IncomingUdpRegistry>,
+    next_udp_id: Arc<AtomicU16>,
 }
 
 #[derive(Debug)]
@@ -114,11 +142,14 @@ impl AsyncWrite for ShadowQuicStream {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Client {
     endpoint: Endpoint,
-    options: ClientOptions,
-    connection: Arc<Mutex<Option<quinn::Connection>>>,
+    server: SocketAddr,
+    server_name: String,
+    congestion: CongestionConfig,
+    authentication: ClientAuthentication,
+    connection: Arc<Mutex<Option<Arc<ClientConnection>>>>,
 }
 
 impl Client {
@@ -145,43 +176,163 @@ impl Client {
         };
         let endpoint = bind_endpoint(bind, None)?;
         endpoint.set_default_client_config(config);
-        Ok(Self {
+        Ok(Self::from_endpoint(
             endpoint,
-            options,
-            connection: Arc::new(Mutex::new(None)),
-        })
+            options.server,
+            options.server_name,
+            options.congestion,
+            ClientAuthentication::Jls,
+        ))
     }
 
-    async fn connection(&self) -> Result<quinn::Connection> {
+    pub(crate) fn new_sunny(options: SunnyClientOptions) -> Result<Self> {
+        if options.server_name.is_empty() {
+            return Err(Error::InvalidServerName(options.server_name));
+        }
+        let mut roots = if options.ca_certificates.is_empty() {
+            RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.into(),
+            }
+        } else {
+            RootCertStore::empty()
+        };
+        for certificate in &options.ca_certificates {
+            roots.add(CertificateDer::from(certificate.clone()))?;
+        }
+        let mut tls = RustlsClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        tls.enable_early_data = options.zero_rtt;
+        let crypto =
+            QuicClientConfig::try_from(tls).map_err(|error| Error::QuicTls(error.to_string()))?;
+        let mut config = ClientConfig::new(Arc::new(crypto));
+        config.transport_config(Arc::new(shadowquic_transport_config()));
+        let bind = match options.server.ip() {
+            IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+        };
+        let endpoint = bind_endpoint(bind, None)?;
+        endpoint.set_default_client_config(config);
+        Ok(Self::from_endpoint(
+            endpoint,
+            options.server,
+            options.server_name,
+            options.congestion,
+            ClientAuthentication::Sunny {
+                credential: options.credential,
+            },
+        ))
+    }
+
+    fn from_endpoint(
+        endpoint: Endpoint,
+        server: SocketAddr,
+        server_name: String,
+        congestion: CongestionConfig,
+        authentication: ClientAuthentication,
+    ) -> Self {
+        Self {
+            endpoint,
+            server,
+            server_name,
+            congestion,
+            authentication,
+            connection: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    async fn connection_state(&self) -> Result<Arc<ClientConnection>> {
         let mut cached = self.connection.lock().await;
-        if let Some(connection) = cached.as_ref()
-            && connection.close_reason().is_none()
+        if let Some(state) = cached.as_ref()
+            && state.connection.close_reason().is_none()
         {
-            return Ok(connection.clone());
+            return Ok(Arc::clone(state));
         }
-        let connecting = self
-            .endpoint
-            .connect(self.options.server, &self.options.server_name)?;
+        let connecting = self.endpoint.connect(self.server, &self.server_name)?;
         let connection = connecting.await?;
-        apply_congestion(&connection, self.options.congestion)?;
-        if let Some(data) = connection.handshake_data()
-            && let Some(data) = data.downcast_ref::<quinn_proto::crypto::rustls::HandshakeData>()
-            && data.jls_authenticated != Some(true)
-        {
-            connection.close(0u32.into(), b"JLS authentication failed");
-            return Err(Error::JlsAuthenticationFailed);
+        apply_congestion(&connection, self.congestion)?;
+        match self.authentication {
+            ClientAuthentication::Jls => {
+                if let Some(data) = connection.handshake_data()
+                    && let Some(data) =
+                        data.downcast_ref::<quinn_proto::crypto::rustls::HandshakeData>()
+                    && data.jls_authenticated != Some(true)
+                {
+                    connection.close(0u32.into(), b"JLS authentication failed");
+                    return Err(Error::JlsAuthenticationFailed);
+                }
+            }
+            ClientAuthentication::Sunny { credential } => {
+                let (mut send, _) = connection.open_bi().await?;
+                send.write_all(&[SQ_AUTHENTICATE]).await?;
+                send.write_all(&credential).await?;
+                send.finish()
+                    .map_err(|error| Error::Protocol(error.to_string()))?;
+            }
         }
-        *cached = Some(connection.clone());
-        Ok(connection)
+        let state = Arc::new(ClientConnection {
+            connection,
+            incoming_udp: Arc::new(IncomingUdpRegistry::default()),
+            next_udp_id: Arc::new(AtomicU16::new(0)),
+        });
+        if matches!(&self.authentication, ClientAuthentication::Sunny { .. }) {
+            spawn_client_udp_receiver(Arc::clone(&state));
+        }
+        *cached = Some(Arc::clone(&state));
+        Ok(state)
+    }
+
+    #[cfg(test)]
+    async fn connection(&self) -> Result<quinn::Connection> {
+        Ok(self.connection_state().await?.connection.clone())
     }
 
     pub async fn connect(&self, destination: Address) -> Result<ShadowQuicStream> {
-        let connection = self.connection().await?;
-        let (mut send, recv) = connection.open_bi().await?;
+        let state = self.connection_state().await?;
+        let (mut send, recv) = state.connection.open_bi().await?;
         let request = encode_connect(&destination)?;
         send.write_all(&request).await?;
         send.flush().await?;
         Ok(ShadowQuicStream::new(send, recv))
+    }
+
+    pub async fn associate(
+        &self,
+        destination: Address,
+        over_stream: bool,
+    ) -> Result<Arc<ShadowQuicPacketConnection>> {
+        let state = self.connection_state().await?;
+        let (mut send, recv) = state.connection.open_bi().await?;
+        send.write_all(&[if over_stream {
+            SQ_ASSOCIATE_OVER_STREAM
+        } else {
+            SQ_ASSOCIATE_OVER_DATAGRAM
+        }])
+        .await?;
+        send.write_all(&encode_address(&destination)?).await?;
+        send.flush().await?;
+        let (packet_sender, packet_receiver) = mpsc::channel(256);
+        let incoming_udp = Arc::clone(&state.incoming_udp);
+        tokio::spawn(async move {
+            if let Err(error) = handle_udp_control_stream(recv, incoming_udp, packet_sender).await {
+                tracing::debug!(%error, "SQuic UDP control stream closed");
+            }
+        });
+        Ok(Arc::new(ShadowQuicPacketConnection {
+            connection: state.connection.clone(),
+            mode: if over_stream {
+                UdpMode::Stream
+            } else {
+                UdpMode::Datagram
+            },
+            next_id: Arc::clone(&state.next_udp_id),
+            incoming: Mutex::new(packet_receiver),
+            outgoing: Mutex::new(OutgoingUdpState {
+                control: send,
+                contexts: HashMap::new(),
+            }),
+        }))
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -190,7 +341,9 @@ impl Client {
 
     pub async fn congestion_kind(&self) -> Option<CongestionKind> {
         let connection = self.connection.lock().await;
-        connection.as_ref().and_then(connection_congestion_kind)
+        connection
+            .as_ref()
+            .and_then(|state| connection_congestion_kind(&state.connection))
     }
 
     pub fn close(&self) {
@@ -213,6 +366,22 @@ pub struct ServerOptions {
     pub jls_rate_limit: u64,
     pub congestion: CongestionConfig,
     pub zero_rtt: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SunnyServerOptions {
+    pub listen: SocketAddr,
+    pub users: Vec<User>,
+    pub certificate_chain: Vec<Vec<u8>>,
+    pub private_key: Vec<u8>,
+    pub congestion: CongestionConfig,
+    pub zero_rtt: bool,
+}
+
+#[derive(Clone)]
+enum ServerAuthentication {
+    Jls,
+    Sunny(Arc<HashMap<[u8; 64], String>>),
 }
 
 #[derive(Debug)]
@@ -248,35 +417,76 @@ pub struct Server {
     incoming: Mutex<mpsc::Receiver<Accepted>>,
     accept_task: tokio::task::JoinHandle<()>,
     congestion: Arc<RwLock<CongestionConfig>>,
+    authentication: Arc<RwLock<ServerAuthentication>>,
 }
 
 impl Server {
     pub fn bind(options: ServerOptions) -> Result<Self> {
         let server_config = build_server_config(&options)?;
-        let endpoint = bind_endpoint(options.listen, Some(server_config))?;
+        Self::bind_inner(
+            options.listen,
+            server_config,
+            options.congestion,
+            ServerAuthentication::Jls,
+            "ShadowQuic",
+        )
+    }
+
+    pub(crate) fn bind_sunny(options: SunnyServerOptions) -> Result<Self> {
+        let server_config = build_sunny_server_config(
+            options.certificate_chain,
+            options.private_key,
+            options.zero_rtt,
+        )?;
+        let authentication = ServerAuthentication::Sunny(Arc::new(sunny_users(&options.users)));
+        Self::bind_inner(
+            options.listen,
+            server_config,
+            options.congestion,
+            authentication,
+            "SunnyQUIC",
+        )
+    }
+
+    fn bind_inner(
+        listen: SocketAddr,
+        server_config: ServerConfig,
+        initial_congestion: CongestionConfig,
+        initial_authentication: ServerAuthentication,
+        protocol: &'static str,
+    ) -> Result<Self> {
+        let endpoint = bind_endpoint(listen, Some(server_config))?;
         let (sender, receiver) = mpsc::channel(256);
         let accept_endpoint = endpoint.clone();
-        let congestion = Arc::new(RwLock::new(options.congestion));
+        let congestion = Arc::new(RwLock::new(initial_congestion));
         let accept_congestion = Arc::clone(&congestion);
+        let authentication = Arc::new(RwLock::new(initial_authentication));
+        let accept_authentication = Arc::clone(&authentication);
         let accept_task = tokio::spawn(async move {
             while let Some(incoming) = accept_endpoint.accept().await {
                 let sender = sender.clone();
-                let congestion = *accept_congestion
+                let congestion = *accept_congestion.read().expect("SQuic congestion lock");
+                let authentication = accept_authentication
                     .read()
-                    .expect("ShadowQuic congestion lock");
+                    .expect("SQuic authentication lock")
+                    .clone();
                 tokio::spawn(async move {
                     match incoming.await {
                         Ok(connection) => {
                             if let Err(error) = apply_congestion(&connection, congestion) {
                                 connection.close(0u32.into(), b"congestion control failed");
-                                tracing::debug!(%error, "ShadowQuic congestion setup failed");
+                                tracing::debug!(%error, %protocol, "SQuic congestion setup failed");
                                 return;
                             }
-                            if let Err(error) = serve_connection(connection, sender).await {
-                                tracing::debug!(%error, "ShadowQuic connection closed");
+                            if let Err(error) =
+                                serve_connection(connection, sender, authentication, protocol).await
+                            {
+                                tracing::debug!(%error, %protocol, "SQuic connection closed");
                             }
                         }
-                        Err(error) => tracing::debug!(%error, "ShadowQuic QUIC handshake failed"),
+                        Err(error) => {
+                            tracing::debug!(%error, %protocol, "SQuic QUIC handshake failed")
+                        }
                     }
                 });
             }
@@ -286,6 +496,7 @@ impl Server {
             incoming: Mutex::new(receiver),
             accept_task,
             congestion,
+            authentication,
         })
     }
 
@@ -301,6 +512,22 @@ impl Server {
         *self.congestion.write().expect("ShadowQuic congestion lock") = options.congestion;
         self.endpoint
             .set_server_config(Some(build_server_config(&options)?));
+        Ok(())
+    }
+
+    pub(crate) fn update_sunny_config(&self, options: SunnyServerOptions) -> Result<()> {
+        let server_config = build_sunny_server_config(
+            options.certificate_chain,
+            options.private_key,
+            options.zero_rtt,
+        )?;
+        *self.congestion.write().expect("SQuic congestion lock") = options.congestion;
+        *self
+            .authentication
+            .write()
+            .expect("SQuic authentication lock") =
+            ServerAuthentication::Sunny(Arc::new(sunny_users(&options.users)));
+        self.endpoint.set_server_config(Some(server_config));
         Ok(())
     }
 
@@ -328,6 +555,55 @@ fn apply_congestion(connection: &quinn::Connection, congestion: CongestionConfig
     } else {
         Err(Error::CongestionControl)
     }
+}
+
+async fn wait_for_sunny_auth(
+    authentication: &ServerAuthentication,
+    mut receiver: watch::Receiver<Option<std::result::Result<String, String>>>,
+) -> Result<String> {
+    if matches!(authentication, ServerAuthentication::Jls) {
+        return Ok(String::new());
+    }
+    loop {
+        if let Some(result) = receiver.borrow().clone() {
+            return result.map_err(Error::Protocol);
+        }
+        tokio::time::timeout(SUNNY_AUTH_TIMEOUT, receiver.changed())
+            .await
+            .map_err(|_| Error::Protocol("SunnyQUIC authentication timed out".into()))?
+            .map_err(|_| Error::Closed)?;
+    }
+}
+
+fn spawn_client_udp_receiver(state: Arc<ClientConnection>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                datagram = state.connection.read_datagram() => match datagram {
+                    Ok(datagram) => {
+                        if let Err(error) = handle_incoming_udp_datagram(
+                            datagram,
+                            Arc::clone(&state.incoming_udp),
+                        ).await {
+                            tracing::debug!(%error, "SQuic client UDP datagram dropped");
+                        }
+                    }
+                    Err(error) => break tracing::debug!(%error, "SQuic client datagram receiver stopped"),
+                },
+                stream = state.connection.accept_uni() => match stream {
+                    Ok(stream) => {
+                        let incoming_udp = Arc::clone(&state.incoming_udp);
+                        tokio::spawn(async move {
+                            if let Err(error) = handle_incoming_udp_stream(stream, incoming_udp).await {
+                                tracing::debug!(%error, "SQuic client UDP stream closed");
+                            }
+                        });
+                    }
+                    Err(error) => break tracing::debug!(%error, "SQuic client stream receiver stopped"),
+                },
+            }
+        }
+    });
 }
 
 fn shadowquic_transport_config() -> TransportConfig {
@@ -372,6 +648,64 @@ fn build_server_config(options: &ServerOptions) -> Result<ServerConfig> {
     let mut config = ServerConfig::with_crypto(Arc::new(crypto));
     config.transport_config(Arc::new(shadowquic_transport_config()));
     Ok(config)
+}
+
+fn build_sunny_server_config(
+    certificate_chain: Vec<Vec<u8>>,
+    private_key: Vec<u8>,
+    zero_rtt: bool,
+) -> Result<ServerConfig> {
+    let certificates = certificate_chain
+        .into_iter()
+        .map(CertificateDer::from)
+        .collect();
+    let private_key = detect_private_key(private_key)?;
+    let mut tls = RustlsServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)?;
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    tls.max_early_data_size = if zero_rtt { u32::MAX } else { 0 };
+    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
+        .map_err(|error| Error::QuicTls(error.to_string()))?;
+    let mut config = ServerConfig::with_crypto(Arc::new(crypto));
+    config.transport_config(Arc::new(shadowquic_transport_config()));
+    Ok(config)
+}
+
+fn detect_private_key(key: Vec<u8>) -> Result<PrivateKeyDer<'static>> {
+    let candidates = [
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.clone())),
+        PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(key.clone())),
+        PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(key)),
+    ];
+    let mut last_error = None;
+    for candidate in candidates {
+        match rustls::crypto::ring::sign::any_supported_type(&candidate) {
+            Ok(_) => return Ok(candidate),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(Error::Tls(last_error.expect("private key candidates")))
+}
+
+fn sunny_users(users: &[User]) -> HashMap<[u8; 64], String> {
+    users
+        .iter()
+        .map(|user| {
+            (
+                sunny_credential(&user.name, &user.password),
+                user.name.clone(),
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn sunny_credential(username: &str, password: &str) -> [u8; 64] {
+    let input = format!("{username}:{password}");
+    let digest = ring::digest::digest(&ring::digest::SHA256, input.as_bytes());
+    let mut credential = [0u8; 64];
+    credential[..digest.as_ref().len()].copy_from_slice(digest.as_ref());
+    credential
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -512,20 +846,27 @@ impl ShadowQuicPacketConnection {
 async fn serve_connection(
     connection: quinn::Connection,
     sender: mpsc::Sender<Accepted>,
+    authentication: ServerAuthentication,
+    protocol: &'static str,
 ) -> Result<()> {
     let source = connection.remote_address();
-    let user = match connection.handshake_data() {
-        Some(data) => match data.downcast::<quinn_proto::crypto::rustls::HandshakeData>() {
-            Ok(data) if data.jls_authenticated == Some(true) => data.jls_user.unwrap_or_default(),
-            _ => {
-                connection.close(0u32.into(), b"JLS authentication failed");
+    let user = match &authentication {
+        ServerAuthentication::Jls => match connection.handshake_data() {
+            Some(data) => match data.downcast::<quinn_proto::crypto::rustls::HandshakeData>() {
+                Ok(data) if data.jls_authenticated == Some(true) => {
+                    data.jls_user.unwrap_or_default()
+                }
+                _ => {
+                    connection.close(0u32.into(), b"JLS authentication failed");
+                    return Err(Error::JlsAuthenticationFailed);
+                }
+            },
+            None => {
+                connection.close(0u32.into(), b"JLS authentication missing");
                 return Err(Error::JlsAuthenticationFailed);
             }
         },
-        None => {
-            connection.close(0u32.into(), b"JLS authentication missing");
-            return Err(Error::JlsAuthenticationFailed);
-        }
+        ServerAuthentication::Sunny(_) => String::new(),
     };
     let congestion = connection_congestion_kind(&connection).ok_or(Error::CongestionControl)?;
     let send_rate = match congestion {
@@ -539,7 +880,7 @@ async fn serve_connection(
         configured_send_bps = send_rate,
         rtt_ms = path.rtt.as_secs_f64() * 1_000.0,
         mtu = path.current_mtu,
-        "ShadowQuic server transport configured"
+        "SQuic server transport configured"
     );
     let _window_task = AdaptiveWindowTask::spawn(
         connection.clone(),
@@ -550,6 +891,7 @@ async fn serve_connection(
     );
     let incoming_udp = Arc::new(IncomingUdpRegistry::default());
     let next_udp_id = Arc::new(AtomicU16::new(0));
+    let (auth_sender, auth_receiver) = watch::channel(None);
 
     let result = loop {
         tokio::select! {
@@ -558,6 +900,9 @@ async fn serve_connection(
                     let connection = connection.clone();
                     let sender = sender.clone();
                     let user = user.clone();
+                    let authentication = authentication.clone();
+                    let auth_sender = auth_sender.clone();
+                    let auth_receiver = auth_receiver.clone();
                     let incoming_udp = Arc::clone(&incoming_udp);
                     let next_udp_id = Arc::clone(&next_udp_id);
                     tokio::spawn(async move {
@@ -568,10 +913,13 @@ async fn serve_connection(
                             sender,
                             source,
                             user,
+                            authentication,
+                            auth_sender,
+                            auth_receiver,
                             incoming_udp,
                             next_udp_id,
                         ).await {
-                            tracing::debug!(%error, "ShadowQuic bidirectional stream closed");
+                            tracing::debug!(%error, %protocol, "SQuic bidirectional stream closed");
                         }
                     });
                 }
@@ -580,9 +928,16 @@ async fn serve_connection(
             stream = connection.accept_uni() => match stream {
                 Ok(recv) => {
                     let incoming_udp = Arc::clone(&incoming_udp);
+                    let authentication = authentication.clone();
+                    let auth_receiver = auth_receiver.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = handle_incoming_udp_stream(recv, incoming_udp).await {
-                            tracing::debug!(%error, "ShadowQuic UDP unidirectional stream closed");
+                        let result = async {
+                            wait_for_sunny_auth(&authentication, auth_receiver).await?;
+                            handle_incoming_udp_stream(recv, incoming_udp).await
+                        }
+                        .await;
+                        if let Err(error) = result {
+                            tracing::debug!(%error, %protocol, "SQuic UDP unidirectional stream closed");
                         }
                     });
                 }
@@ -591,9 +946,16 @@ async fn serve_connection(
             datagram = connection.read_datagram() => match datagram {
                 Ok(datagram) => {
                     let incoming_udp = Arc::clone(&incoming_udp);
+                    let authentication = authentication.clone();
+                    let auth_receiver = auth_receiver.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = handle_incoming_udp_datagram(datagram, incoming_udp).await {
-                            tracing::debug!(%error, "ShadowQuic UDP datagram dropped");
+                        let result = async {
+                            wait_for_sunny_auth(&authentication, auth_receiver).await?;
+                            handle_incoming_udp_datagram(datagram, incoming_udp).await
+                        }
+                        .await;
+                        if let Err(error) = result {
+                            tracing::debug!(%error, %protocol, "SQuic UDP datagram dropped");
                         }
                     });
                 }
@@ -613,25 +975,57 @@ async fn handle_bi_stream(
     sender: mpsc::Sender<Accepted>,
     source: SocketAddr,
     user: String,
+    authentication: ServerAuthentication,
+    auth_sender: watch::Sender<Option<std::result::Result<String, String>>>,
+    auth_receiver: watch::Receiver<Option<std::result::Result<String, String>>>,
     incoming_udp: Arc<IncomingUdpRegistry>,
     next_udp_id: Arc<AtomicU16>,
 ) -> Result<()> {
     let mut opcode = [0u8; 1];
     recv.read_exact(&mut opcode).await?;
     match opcode[0] {
+        SQ_AUTHENTICATE => {
+            let ServerAuthentication::Sunny(users) = authentication else {
+                let code = VarInt::from_u32(STREAM_ERROR_CODE);
+                let _ = send.reset(code);
+                let _ = recv.stop(code);
+                return Ok(());
+            };
+            let mut credential = [0u8; 64];
+            recv.read_exact(&mut credential).await?;
+            match users.get(&credential) {
+                Some(username) => {
+                    let _ = auth_sender.send(Some(Ok(username.clone())));
+                }
+                None => {
+                    let _ = auth_sender.send(Some(Err("invalid SunnyQUIC credentials".into())));
+                    connection.close(
+                        VarInt::from_u32(SUNNY_AUTH_ERROR_CODE),
+                        b"authentication failed",
+                    );
+                    return Err(Error::Protocol("SunnyQUIC authentication failed".into()));
+                }
+            }
+        }
         SQ_CONNECT => {
+            let authenticated_user = wait_for_sunny_auth(&authentication, auth_receiver).await?;
             let destination = decode_address(&mut recv).await?;
             sender
                 .send(Accepted::Stream(AcceptedStream {
                     stream: ShadowQuicStream::new(send, recv),
                     destination,
-                    user,
+                    user: if authenticated_user.is_empty() {
+                        user
+                    } else {
+                        authenticated_user
+                    },
                     source,
                 }))
                 .await
                 .map_err(|_| Error::Closed)?;
         }
         SQ_ASSOCIATE_OVER_DATAGRAM | SQ_ASSOCIATE_OVER_STREAM => {
+            let authenticated_user = wait_for_sunny_auth(&authentication, auth_receiver).await?;
             let destination = decode_address(&mut recv).await?;
             let mode = if opcode[0] == SQ_ASSOCIATE_OVER_DATAGRAM {
                 UdpMode::Datagram
@@ -653,14 +1047,21 @@ async fn handle_bi_stream(
                 .send(Accepted::Packet(AcceptedPacket {
                     connection: packet_connection,
                     destination,
-                    user,
+                    user: if authenticated_user.is_empty() {
+                        user
+                    } else {
+                        authenticated_user
+                    },
                     source,
                 }))
                 .await
                 .map_err(|_| Error::Closed)?;
             handle_udp_control_stream(recv, incoming_udp, packet_sender).await?;
         }
-        SQ_EXTENSION => handle_extension(&connection, &mut send, &mut recv).await?,
+        SQ_EXTENSION => {
+            wait_for_sunny_auth(&authentication, auth_receiver).await?;
+            handle_extension(&connection, &mut send, &mut recv).await?
+        }
         opcode => {
             tracing::debug!(opcode, "unsupported ShadowQuic stream request");
             let code = VarInt::from_u32(STREAM_ERROR_CODE);

@@ -2,13 +2,13 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicU32, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 
 use crate::{Address, Error, Result, varint};
 
@@ -16,6 +16,7 @@ const UDP_HEADER_SIZE: usize = 8;
 const MAX_UDP_SIZE: usize = 4096;
 const MAX_ADDRESS_LENGTH: usize = 2048;
 const FRAGMENT_LIFETIME: Duration = Duration::from_secs(10);
+const INITIAL_UDP_MTU: usize = 1200 - 3;
 
 #[derive(Debug)]
 pub struct Hysteria2Packet {
@@ -118,22 +119,25 @@ impl Defragger {
 pub struct Hysteria2PacketConnection {
     connection: quinn::Connection,
     session_id: u32,
-    next_packet_id: AtomicU16,
+    next_packet_id: AtomicU32,
     incoming_sender: mpsc::Sender<Hysteria2Packet>,
     incoming: Mutex<mpsc::Receiver<Hysteria2Packet>>,
     defragger: Mutex<Defragger>,
+    activity: watch::Sender<Instant>,
 }
 
 impl Hysteria2PacketConnection {
     pub(crate) fn new(connection: quinn::Connection, session_id: u32) -> Arc<Self> {
         let (incoming_sender, incoming) = mpsc::channel(64);
+        let (activity, _) = watch::channel(Instant::now());
         Arc::new(Self {
             connection,
             session_id,
-            next_packet_id: AtomicU16::new(0),
+            next_packet_id: AtomicU32::new(0),
             incoming_sender,
             incoming: Mutex::new(incoming),
             defragger: Mutex::new(Defragger::default()),
+            activity,
         })
     }
 
@@ -150,17 +154,23 @@ impl Hysteria2PacketConnection {
                 "Hysteria2 UDP packet exceeds 4096 bytes".into(),
             ));
         }
-        let packet_id = self
+        let packet_id = (self
             .next_packet_id
             .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
+            .wrapping_add(1)
+            % u32::from(u16::MAX)) as u16;
         let address = packet.destination.to_string();
         if address.is_empty() || address.len() > MAX_ADDRESS_LENGTH {
             return Err(Error::InvalidAddress);
         }
         let address_length = varint::encode(address.len() as u64)?;
         let header_size = UDP_HEADER_SIZE + address_length.len() + address.len();
-        let max_datagram_size = self.connection.max_datagram_size().unwrap_or(1200);
+        let max_datagram_size = self
+            .connection
+            .max_datagram_size()
+            .map(|size| size.saturating_sub(3))
+            .unwrap_or(INITIAL_UDP_MTU)
+            .min(INITIAL_UDP_MTU);
         if header_size >= max_datagram_size {
             return Err(Error::Protocol(
                 "Hysteria2 UDP address exceeds QUIC datagram size".into(),
@@ -199,14 +209,39 @@ impl Hysteria2PacketConnection {
                 .send_datagram(Bytes::from(frame))
                 .map_err(|error| Error::Protocol(error.to_string()))?;
         }
+        self.activity.send_replace(Instant::now());
         Ok(())
     }
 
     pub async fn recv(&self) -> Result<Hysteria2Packet> {
         let mut incoming = self.incoming.lock().await;
         tokio::select! {
-            packet = incoming.recv() => packet.ok_or(Error::Closed),
+            packet = incoming.recv() => {
+                let packet = packet.ok_or(Error::Closed)?;
+                self.activity.send_replace(Instant::now());
+                Ok(packet)
+            },
             error = self.connection.closed() => Err(error.into()),
+        }
+    }
+
+    pub async fn wait_inactive(&self, timeout: Duration) {
+        let mut activity = self.activity.subscribe();
+        loop {
+            let deadline = tokio::time::Instant::from_std(*activity.borrow() + timeout);
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {
+                    if Instant::now().duration_since(*activity.borrow()) >= timeout {
+                        return;
+                    }
+                }
+                changed = activity.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                _ = self.connection.closed() => return,
+            }
         }
     }
 }
