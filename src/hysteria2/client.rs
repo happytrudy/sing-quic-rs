@@ -16,7 +16,7 @@ use crate::{Address, Error, Result};
 
 use super::protocol::{
     CongestionReceive, HEADER_AUTH, HEADER_CC_RX, HEADER_PADDING, STATUS_AUTH_OK, URL_AUTHORITY,
-    URL_PATH, padding, parse_congestion_receive, read_tcp_response, write_tcp_request,
+    URL_PATH, padding, parse_congestion_receive,
 };
 use super::{
     ClientBandwidth, Hysteria2Stream,
@@ -82,7 +82,7 @@ impl Client {
         tls.alpn_protocols = vec![ALPN_H3.to_vec()];
         let crypto =
             QuicClientConfig::try_from(tls).map_err(|error| Error::QuicTls(error.to_string()))?;
-        let transport = base_transport_config(transport_options);
+        let transport = base_transport_config(transport_options)?;
         let mut client_config = ClientConfig::new(Arc::new(crypto));
         client_config.transport_config(Arc::new(transport));
 
@@ -119,10 +119,8 @@ impl Client {
 
     pub async fn connect(&self, destination: Address) -> Result<Hysteria2Stream> {
         let connection = self.connection().await?;
-        let (mut send, mut recv) = connection.connection.open_bi().await?;
-        write_tcp_request(&mut send, &destination).await?;
-        read_tcp_response(&mut recv).await?;
-        Ok(Hysteria2Stream::new(send, recv))
+        let (send, recv) = connection.connection.open_bi().await?;
+        Hysteria2Stream::client(send, recv, &destination)
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {

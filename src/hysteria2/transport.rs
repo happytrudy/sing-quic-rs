@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use crate::congestion::SwitchableCongestionFactory;
+use crate::{Error, Result, congestion::SwitchableCongestionFactory};
 use quinn::{Endpoint, EndpointConfig, ServerConfig, TokioRuntime, TransportConfig, VarInt};
 use socket2::{Domain, Protocol, Socket, Type};
 
@@ -17,11 +17,16 @@ pub(crate) const DATAGRAM_BUFFER_SIZE: usize = 2_500_000;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct QuicTransportOptions {
+    pub idle_timeout: Option<Duration>,
+    pub keep_alive_period: Option<Duration>,
+    pub stream_receive_window: u64,
+    pub connection_receive_window: u64,
+    pub max_concurrent_streams: u64,
     pub initial_packet_size: u16,
     pub disable_path_mtu_discovery: bool,
 }
 
-pub(crate) fn base_transport_config(options: QuicTransportOptions) -> TransportConfig {
+pub(crate) fn base_transport_config(options: QuicTransportOptions) -> Result<TransportConfig> {
     let mut transport = TransportConfig::default();
     transport
         .congestion_controller_factory(Arc::new(SwitchableCongestionFactory))
@@ -32,13 +37,40 @@ pub(crate) fn base_transport_config(options: QuicTransportOptions) -> TransportC
         .datagram_send_buffer_size(DATAGRAM_BUFFER_SIZE)
         .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()))
         .keep_alive_interval(Some(Duration::from_secs(10)));
+    if let Some(idle_timeout) = options.idle_timeout {
+        transport.max_idle_timeout(Some(idle_timeout.try_into().map_err(|_| {
+            Error::Protocol("QUIC idle_timeout exceeds the transport limit".into())
+        })?));
+    }
+    if let Some(keep_alive_period) = options.keep_alive_period {
+        transport.keep_alive_interval(Some(keep_alive_period));
+    }
+    if options.stream_receive_window > 0 {
+        transport.stream_receive_window(VarInt::from_u64(options.stream_receive_window).map_err(
+            |_| Error::Protocol("QUIC stream_receive_window exceeds the transport limit".into()),
+        )?);
+    }
+    if options.connection_receive_window > 0 {
+        transport.receive_window(VarInt::from_u64(options.connection_receive_window).map_err(
+            |_| {
+                Error::Protocol("QUIC connection_receive_window exceeds the transport limit".into())
+            },
+        )?);
+    }
+    if options.max_concurrent_streams > 0 {
+        transport.max_concurrent_bidi_streams(
+            VarInt::from_u64(options.max_concurrent_streams).map_err(|_| {
+                Error::Protocol("QUIC max_concurrent_streams exceeds the transport limit".into())
+            })?,
+        );
+    }
     if options.initial_packet_size > 0 {
         transport.initial_mtu(options.initial_packet_size);
     }
     if options.disable_path_mtu_discovery {
         transport.mtu_discovery_config(None);
     }
-    transport
+    Ok(transport)
 }
 
 pub(crate) fn bind_endpoint(
@@ -111,11 +143,13 @@ mod tests {
         assert_eq!(STREAM_RECEIVE_WINDOW, 8_388_608);
         assert_eq!(CONNECTION_RECEIVE_WINDOW, 20_971_520);
         assert!(SEND_WINDOW >= u64::from(CONNECTION_RECEIVE_WINDOW));
-        let _ = base_transport_config(QuicTransportOptions::default());
+        let _ = base_transport_config(QuicTransportOptions::default()).unwrap();
         let _ = base_transport_config(QuicTransportOptions {
             initial_packet_size: 1200,
             disable_path_mtu_discovery: true,
-        });
+            ..QuicTransportOptions::default()
+        })
+        .unwrap();
     }
 
     #[tokio::test]

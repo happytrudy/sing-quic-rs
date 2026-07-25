@@ -1,4 +1,4 @@
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::{Error, Result};
 
@@ -12,11 +12,6 @@ pub(crate) async fn read<R: AsyncRead + Unpin>(reader: &mut R) -> Result<u64> {
         value = (value << 8) | u64::from(reader.read_u8().await?);
     }
     Ok(value)
-}
-
-pub(crate) async fn write<W: AsyncWrite + Unpin>(writer: &mut W, value: u64) -> Result<()> {
-    writer.write_all(&encode(value)?).await?;
-    Ok(())
 }
 
 pub(crate) fn encode(value: u64) -> Result<Vec<u8>> {

@@ -607,7 +607,8 @@ fn spawn_client_udp_receiver(state: Arc<ClientConnection>) {
 }
 
 fn shadowquic_transport_config() -> TransportConfig {
-    let mut transport = base_transport_config(Default::default());
+    let mut transport =
+        base_transport_config(Default::default()).expect("default QUIC transport options");
     transport
         .max_concurrent_bidi_streams(VarInt::from_u32(MAX_CONCURRENT_STREAMS))
         .max_concurrent_uni_streams(VarInt::from_u32(MAX_CONCURRENT_STREAMS))

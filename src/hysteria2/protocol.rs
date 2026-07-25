@@ -1,5 +1,5 @@
 use rand::{Rng, distributions::Alphanumeric};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::{Address, Error, Result, varint};
 
@@ -50,22 +50,19 @@ pub(crate) fn padding(min: usize, max: usize) -> String {
         .collect()
 }
 
-pub(crate) async fn write_tcp_request<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    destination: &Address,
-) -> Result<()> {
+pub(crate) fn encode_tcp_request(destination: &Address) -> Result<Vec<u8>> {
     let address = destination.to_string();
     if address.is_empty() || address.len() > MAX_ADDRESS_LENGTH {
         return Err(Error::InvalidAddress);
     }
     let padding = padding(64, 512);
-    varint::write(writer, FRAME_TYPE_TCP_REQUEST).await?;
-    varint::write(writer, address.len() as u64).await?;
-    writer.write_all(address.as_bytes()).await?;
-    varint::write(writer, padding.len() as u64).await?;
-    writer.write_all(padding.as_bytes()).await?;
-    writer.flush().await?;
-    Ok(())
+    let mut encoded = Vec::with_capacity(address.len() + padding.len() + 16);
+    encoded.extend_from_slice(&varint::encode(FRAME_TYPE_TCP_REQUEST)?);
+    encoded.extend_from_slice(&varint::encode(address.len() as u64)?);
+    encoded.extend_from_slice(address.as_bytes());
+    encoded.extend_from_slice(&varint::encode(padding.len() as u64)?);
+    encoded.extend_from_slice(padding.as_bytes());
+    Ok(encoded)
 }
 
 pub(crate) async fn read_tcp_request<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Address> {
@@ -92,23 +89,20 @@ pub(crate) async fn read_tcp_request<R: AsyncRead + Unpin>(reader: &mut R) -> Re
         .parse()
 }
 
-pub(crate) async fn write_tcp_response<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    result: std::result::Result<(), &str>,
-) -> Result<()> {
+pub(crate) fn encode_tcp_response(result: std::result::Result<(), &str>) -> Result<Vec<u8>> {
     let (status, message) = match result {
         Ok(()) => (0, ""),
         Err(message) => (1, message),
     };
     let message = &message.as_bytes()[..message.len().min(MAX_MESSAGE_LENGTH)];
     let padding = padding(128, 1024);
-    writer.write_u8(status).await?;
-    varint::write(writer, message.len() as u64).await?;
-    writer.write_all(message).await?;
-    varint::write(writer, padding.len() as u64).await?;
-    writer.write_all(padding.as_bytes()).await?;
-    writer.flush().await?;
-    Ok(())
+    let mut encoded = Vec::with_capacity(message.len() + padding.len() + 16);
+    encoded.push(status);
+    encoded.extend_from_slice(&varint::encode(message.len() as u64)?);
+    encoded.extend_from_slice(message);
+    encoded.extend_from_slice(&varint::encode(padding.len() as u64)?);
+    encoded.extend_from_slice(padding.as_bytes());
+    Ok(encoded)
 }
 
 pub(crate) async fn read_tcp_response<R: AsyncRead + Unpin>(reader: &mut R) -> Result<()> {

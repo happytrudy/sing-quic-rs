@@ -124,10 +124,20 @@ pub struct Hysteria2PacketConnection {
     incoming: Mutex<mpsc::Receiver<Hysteria2Packet>>,
     defragger: Mutex<Defragger>,
     activity: watch::Sender<Instant>,
+    released: Option<mpsc::UnboundedSender<u32>>,
 }
 
 impl Hysteria2PacketConnection {
+    #[cfg(test)]
     pub(crate) fn new(connection: quinn::Connection, session_id: u32) -> Arc<Self> {
+        Self::new_with_release(connection, session_id, None)
+    }
+
+    pub(crate) fn new_with_release(
+        connection: quinn::Connection,
+        session_id: u32,
+        released: Option<mpsc::UnboundedSender<u32>>,
+    ) -> Arc<Self> {
         let (incoming_sender, incoming) = mpsc::channel(64);
         let (activity, _) = watch::channel(Instant::now());
         Arc::new(Self {
@@ -138,6 +148,7 @@ impl Hysteria2PacketConnection {
             incoming: Mutex::new(incoming),
             defragger: Mutex::new(Defragger::default()),
             activity,
+            released,
         })
     }
 
@@ -242,6 +253,14 @@ impl Hysteria2PacketConnection {
                 }
                 _ = self.connection.closed() => return,
             }
+        }
+    }
+}
+
+impl Drop for Hysteria2PacketConnection {
+    fn drop(&mut self) {
+        if let Some(released) = &self.released {
+            let _ = released.send(self.session_id);
         }
     }
 }

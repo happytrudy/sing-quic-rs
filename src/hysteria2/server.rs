@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{Arc, Weak},
+    time::Duration,
 };
 
 use bytes::{Buf, Bytes};
@@ -17,7 +18,7 @@ use rustls::{
         CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
     },
 };
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 
 use crate::congestion::{
     CongestionKind, configure_connection_brutal_with_options, connection_congestion_kind,
@@ -27,7 +28,7 @@ use crate::{Address, Error, Result};
 use super::protocol::{
     CongestionReceive, HEADER_AUTH, HEADER_CC_RX, HEADER_PADDING, HEADER_UDP, STATUS_AUTH_OK,
     URL_AUTHORITY, URL_PATH, congestion_receive_value, padding, parse_congestion_receive,
-    read_tcp_request, write_tcp_response,
+    read_tcp_request,
 };
 use super::{
     Hysteria2PacketConnection, Hysteria2Stream, ServerBandwidth,
@@ -37,7 +38,11 @@ use super::{
 };
 
 const ALPN_H3: &[u8] = b"h3";
-const MAX_MASQUERADE_REQUEST_SIZE: usize = 16 * 1024 * 1024;
+const MAX_MASQUERADE_FIELD_SECTION_SIZE: u64 = 64 * 1024;
+const MAX_MASQUERADE_REQUEST_SIZE: usize = 1024 * 1024;
+const MAX_CONCURRENT_MASQUERADE_REQUESTS: usize = 16;
+const MAX_MASQUERADE_REQUEST_DURATION: Duration = Duration::from_secs(30);
+const MASQUERADE_RESPONSE_CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct User {
@@ -135,18 +140,26 @@ impl Server {
         );
         let (sender, receiver) = mpsc::channel(256);
         let accept_endpoint = endpoint.clone();
+        let masquerade_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_MASQUERADE_REQUESTS));
         let accept_task = tokio::spawn(async move {
             while let Some(incoming) = accept_endpoint.accept().await {
                 let users = Arc::clone(&users);
                 let sender = sender.clone();
                 let masquerade = masquerade.clone();
+                let masquerade_slots = Arc::clone(&masquerade_slots);
                 tokio::spawn(async move {
                     match incoming.await {
                         Ok(connection) => {
                             let observed_connection = connection.clone();
-                            if let Err(error) =
-                                serve_connection(connection, users, sender, bandwidth, masquerade)
-                                    .await
+                            if let Err(error) = serve_connection(
+                                connection,
+                                users,
+                                sender,
+                                bandwidth,
+                                masquerade,
+                                masquerade_slots,
+                            )
+                            .await
                             {
                                 let stats = observed_connection.stats();
                                 if is_normal_connection_close(&error) {
@@ -238,10 +251,12 @@ fn build_server_config(
     tls.alpn_protocols = vec![ALPN_H3.to_vec()];
     let crypto =
         QuicServerConfig::try_from(tls).map_err(|error| Error::QuicTls(error.to_string()))?;
-    let mut transport = base_transport_config(transport_options);
-    transport.max_concurrent_bidi_streams(
-        quinn::VarInt::from_u64(1 << 60).expect("official Hysteria2 stream limit"),
-    );
+    let mut transport = base_transport_config(transport_options)?;
+    if transport_options.max_concurrent_streams == 0 {
+        transport.max_concurrent_bidi_streams(
+            quinn::VarInt::from_u64(1 << 60).expect("official Hysteria2 stream limit"),
+        );
+    }
     let mut server_config = ServerConfig::with_crypto(Arc::new(crypto));
     server_config.disable_path_manager(true);
     server_config.transport_config(Arc::new(transport));
@@ -270,12 +285,15 @@ async fn serve_connection(
     sender: mpsc::Sender<Accepted>,
     bandwidth: ServerBandwidth,
     masquerade: Option<Arc<dyn MasqueradeHandler>>,
+    masquerade_slots: Arc<Semaphore>,
 ) -> Result<()> {
     let source = connection.remote_address();
-    let mut h3_connection: h3::server::Connection<_, Bytes> =
-        h3::server::Connection::new(h3_quinn::Connection::new(connection.clone()))
-            .await
-            .map_err(|error| Error::Http3(error.to_string()))?;
+    let mut h3_builder = h3::server::builder();
+    h3_builder.max_field_section_size(MAX_MASQUERADE_FIELD_SECTION_SIZE);
+    let mut h3_connection: h3::server::Connection<_, Bytes> = h3_builder
+        .build(h3_quinn::Connection::new(connection.clone()))
+        .await
+        .map_err(|error| Error::Http3(error.to_string()))?;
     let resolver = h3_connection
         .accept()
         .await
@@ -301,7 +319,13 @@ async fn serve_connection(
         && request.uri().path() == URL_PATH
         && user.is_some();
     if !authenticated {
-        spawn_masquerade_request(source, request, stream, masquerade.clone());
+        spawn_masquerade_request(
+            source,
+            request,
+            stream,
+            masquerade.clone(),
+            Arc::clone(&masquerade_slots),
+        );
         loop {
             let Some(resolver) = h3_connection
                 .accept()
@@ -314,14 +338,26 @@ async fn serve_connection(
                 .resolve_request()
                 .await
                 .map_err(|error| Error::Http3(error.to_string()))?;
-            spawn_masquerade_request(source, request, stream, masquerade.clone());
+            spawn_masquerade_request(
+                source,
+                request,
+                stream,
+                masquerade.clone(),
+                Arc::clone(&masquerade_slots),
+            );
         }
     }
     if bandwidth.receive_bps > 0
         && bandwidth.ignore_client_bandwidth
         && !matches!(client_receive, CongestionReceive::Rate(rate) if rate > 0)
     {
-        spawn_masquerade_request(source, request, stream, masquerade.clone());
+        spawn_masquerade_request(
+            source,
+            request,
+            stream,
+            masquerade.clone(),
+            Arc::clone(&masquerade_slots),
+        );
         loop {
             let Some(resolver) = h3_connection
                 .accept()
@@ -334,7 +370,13 @@ async fn serve_connection(
                 .resolve_request()
                 .await
                 .map_err(|error| Error::Http3(error.to_string()))?;
-            spawn_masquerade_request(source, request, stream, masquerade.clone());
+            spawn_masquerade_request(
+                source,
+                request,
+                stream,
+                masquerade.clone(),
+                Arc::clone(&masquerade_slots),
+            );
         }
     }
     let send_rate = negotiated_send_rate(bandwidth, client_receive);
@@ -385,6 +427,7 @@ async fn serve_connection(
         .brutal_debug
         .then(|| ConnectionMetricsTask::spawn(connection.clone(), "server", source, congestion));
     let mut udp_sessions = HashMap::<u32, Weak<Hysteria2PacketConnection>>::new();
+    let (released_udp_sender, mut released_udp_receiver) = mpsc::unbounded_channel();
     loop {
         tokio::select! {
             control = poll_fn(|context| h3_connection.poll_control(context)) => {
@@ -409,9 +452,10 @@ async fn serve_connection(
                 {
                     Some(connection) => connection,
                     None => {
-                        let packet_connection = Hysteria2PacketConnection::new(
+                        let packet_connection = Hysteria2PacketConnection::new_with_release(
                             connection.clone(),
                             message.session_id,
+                            Some(released_udp_sender.clone()),
                         );
                         sender
                             .send(Accepted::Packet(AcceptedPacket {
@@ -432,6 +476,15 @@ async fn serve_connection(
                 };
                 packet_connection.input(message).await?;
             }
+            released = released_udp_receiver.recv() => {
+                let session_id = released.expect("UDP release sender lives with connection");
+                if udp_sessions
+                    .get(&session_id)
+                    .is_some_and(|connection| connection.upgrade().is_none())
+                {
+                    udp_sessions.remove(&session_id);
+                }
+            }
         }
     }
 }
@@ -439,16 +492,31 @@ async fn serve_connection(
 fn spawn_masquerade_request<S>(
     source: SocketAddr,
     request: Request<()>,
-    stream: h3::server::RequestStream<S, Bytes>,
+    mut stream: h3::server::RequestStream<S, Bytes>,
     masquerade: Option<Arc<dyn MasqueradeHandler>>,
+    slots: Arc<Semaphore>,
 ) where
     S: h3::quic::BidiStream<Bytes> + Send + 'static,
 {
+    let Ok(permit) = slots.try_acquire_owned() else {
+        stream.stop_sending(h3::error::Code::H3_EXCESSIVE_LOAD);
+        return;
+    };
     tokio::spawn(async move {
-        if let Err(error) =
-            serve_masquerade_request(source, request, stream, masquerade.as_ref()).await
+        let _permit = permit;
+        match tokio::time::timeout(
+            MAX_MASQUERADE_REQUEST_DURATION,
+            serve_masquerade_request(source, request, stream, masquerade.as_ref()),
+        )
+        .await
         {
-            tracing::debug!(%error, "Hysteria2 masquerade request failed");
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "Hysteria2 masquerade request failed");
+            }
+            Err(_) => {
+                tracing::debug!("Hysteria2 masquerade request timed out");
+            }
         }
     });
 }
@@ -532,10 +600,12 @@ where
         .await
         .map_err(|error| Error::Http3(error.to_string()))?;
     if !is_head && body_is_allowed && !body.is_empty() {
-        stream
-            .send_data(Bytes::from(body))
-            .await
-            .map_err(|error| Error::Http3(error.to_string()))?;
+        for chunk in body.chunks(MASQUERADE_RESPONSE_CHUNK_SIZE) {
+            stream
+                .send_data(Bytes::copy_from_slice(chunk))
+                .await
+                .map_err(|error| Error::Http3(error.to_string()))?;
+        }
     }
     stream
         .finish()
@@ -544,7 +614,7 @@ where
 }
 
 async fn handle_stream(
-    mut send: quinn::SendStream,
+    send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     connection: quinn::Connection,
     user: String,
@@ -552,11 +622,10 @@ async fn handle_stream(
     accepted_sender: mpsc::Sender<Accepted>,
 ) -> Result<()> {
     let destination = read_tcp_request(&mut recv).await?;
-    write_tcp_response(&mut send, Ok(())).await?;
     let source = connection.remote_address();
     accepted_sender
         .send(Accepted::Stream(AcceptedStream {
-            stream: Hysteria2Stream::new(send, recv),
+            stream: Hysteria2Stream::server(send, recv)?,
             destination,
             user,
             source,
@@ -860,6 +929,56 @@ mod tests {
         server.close().await;
     }
 
+    #[tokio::test]
+    async fn client_read_first_sends_request_and_waits_for_server_handshake() {
+        let certificate = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certificate_der = certificate.cert.der().to_vec();
+        let server = Arc::new(
+            Server::bind(ServerOptions {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                certificate_chain: vec![certificate_der.clone()],
+                private_key: certificate.signing_key.serialize_der(),
+                users: vec![User {
+                    name: "alice".into(),
+                    password: "secret".into(),
+                }],
+            })
+            .unwrap(),
+        );
+        let server_task = tokio::spawn({
+            let server = Arc::clone(&server);
+            async move {
+                let Accepted::Stream(mut accepted) = server.accept().await.unwrap() else {
+                    panic!("expected Hysteria2 TCP stream");
+                };
+                accepted.stream.handshake_success().await.unwrap();
+                accepted.stream.write_all(b"server greeting").await.unwrap();
+                accepted.stream.shutdown().await.unwrap();
+            }
+        });
+        let client = Client::new(ClientOptions {
+            server: server.local_addr().unwrap(),
+            server_name: "localhost".into(),
+            password: "secret".into(),
+            ca_certificates: vec![certificate_der],
+        })
+        .unwrap();
+        let mut stream = client
+            .connect(Address::new("example.com", 443).unwrap())
+            .await
+            .unwrap();
+        let mut greeting = [0; 15];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut greeting))
+            .await
+            .expect("read-first Hysteria2 handshake timed out")
+            .unwrap();
+        assert_eq!(&greeting, b"server greeting");
+
+        server_task.await.unwrap();
+        client.close();
+        server.close().await;
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn mapped_ipv4_port_rebind_keeps_connection_usable() {
@@ -964,6 +1083,7 @@ mod tests {
                 QuicTransportOptions {
                     initial_packet_size: 1200,
                     disable_path_mtu_discovery: true,
+                    ..QuicTransportOptions::default()
                 },
                 None,
             )
@@ -1000,6 +1120,7 @@ mod tests {
             QuicTransportOptions {
                 initial_packet_size: 1200,
                 disable_path_mtu_discovery: true,
+                ..QuicTransportOptions::default()
             },
         )
         .unwrap();
