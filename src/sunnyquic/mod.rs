@@ -4,7 +4,7 @@
 //! authenticates at the application layer with `SHA256(username:password)`.
 //! The QUIC congestion controller remains the common BBR/Brutal controller.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use crate::{Address, Result};
 
@@ -13,6 +13,31 @@ pub use crate::shadowquic::{
     Accepted, AcceptedPacket, AcceptedStream, CongestionConfig, ShadowQuicPacket,
     ShadowQuicPacketConnection, ShadowQuicStream, User,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransportOptions {
+    pub initial_packet_size: u16,
+    pub max_concurrent_streams: u64,
+    pub connection_receive_window: u64,
+    pub stream_receive_window: u64,
+    pub keep_alive_period: Option<Duration>,
+    pub idle_timeout: Option<Duration>,
+    pub disable_path_mtu_discovery: bool,
+}
+
+impl Default for TransportOptions {
+    fn default() -> Self {
+        Self {
+            initial_packet_size: 1_300,
+            max_concurrent_streams: 1_000,
+            connection_receive_window: 20 * 1024 * 1024,
+            stream_receive_window: 5_000_000,
+            keep_alive_period: None,
+            idle_timeout: Some(Duration::from_secs(30)),
+            disable_path_mtu_discovery: false,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ClientOptions {
@@ -23,6 +48,7 @@ pub struct ClientOptions {
     pub ca_certificates: Vec<Vec<u8>>,
     pub congestion: CongestionConfig,
     pub zero_rtt: bool,
+    pub transport: TransportOptions,
 }
 
 #[derive(Clone, Debug)]
@@ -33,6 +59,7 @@ pub struct ServerOptions {
     pub private_key: Vec<u8>,
     pub congestion: CongestionConfig,
     pub zero_rtt: bool,
+    pub transport: TransportOptions,
 }
 
 pub struct Client {
@@ -50,6 +77,7 @@ impl Client {
                 ca_certificates: options.ca_certificates,
                 congestion: options.congestion,
                 zero_rtt: options.zero_rtt,
+                transport: options.transport,
             })?,
         })
     }
@@ -93,6 +121,7 @@ impl Server {
             private_key: options.private_key.clone(),
             congestion: options.congestion,
             zero_rtt: options.zero_rtt,
+            transport: options.transport,
         })?;
         Ok(Self { inner, options })
     }
@@ -121,6 +150,7 @@ impl Server {
                 private_key: options.private_key.clone(),
                 congestion: options.congestion,
                 zero_rtt: options.zero_rtt,
+                transport: options.transport,
             })
     }
 
@@ -186,6 +216,7 @@ mod tests {
                 private_key,
                 congestion: CongestionConfig::Bbr,
                 zero_rtt: true,
+                transport: TransportOptions::default(),
             })
             .unwrap(),
         );
@@ -197,6 +228,7 @@ mod tests {
             ca_certificates: certificate_chain,
             congestion: CongestionConfig::Bbr,
             zero_rtt: true,
+            transport: TransportOptions::default(),
         })
         .unwrap();
         let server_task = {
@@ -245,6 +277,7 @@ mod tests {
                     disable_loss_compensation: false,
                 },
                 zero_rtt: true,
+                transport: TransportOptions::default(),
             })
             .unwrap(),
         );
@@ -259,6 +292,7 @@ mod tests {
                 disable_loss_compensation: false,
             },
             zero_rtt: true,
+            transport: TransportOptions::default(),
         })
         .unwrap();
         let server_task = {
