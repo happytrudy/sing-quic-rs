@@ -8,6 +8,7 @@ mod error;
 pub mod hysteria2;
 pub mod shadowquic;
 pub mod sunnyquic;
+mod tasks;
 pub mod transport;
 mod varint;
 

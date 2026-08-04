@@ -23,6 +23,7 @@ use tokio::sync::{Mutex, Semaphore, mpsc};
 use crate::congestion::{
     CongestionKind, configure_connection_brutal_with_options, connection_congestion_kind,
 };
+use crate::tasks::TaskGroup;
 use crate::{Address, Error, Result};
 
 use super::protocol::{
@@ -95,6 +96,7 @@ pub struct Server {
     transport_options: QuicTransportOptions,
     incoming: Mutex<mpsc::Receiver<Accepted>>,
     accept_task: tokio::task::JoinHandle<()>,
+    connection_tasks: TaskGroup,
 }
 
 impl Server {
@@ -141,13 +143,15 @@ impl Server {
         let (sender, receiver) = mpsc::channel(256);
         let accept_endpoint = endpoint.clone();
         let masquerade_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_MASQUERADE_REQUESTS));
+        let connection_tasks = TaskGroup::new();
+        let accept_connection_tasks = connection_tasks.clone();
         let accept_task = tokio::spawn(async move {
             while let Some(incoming) = accept_endpoint.accept().await {
                 let users = Arc::clone(&users);
                 let sender = sender.clone();
                 let masquerade = masquerade.clone();
                 let masquerade_slots = Arc::clone(&masquerade_slots);
-                tokio::spawn(async move {
+                accept_connection_tasks.spawn(async move {
                     match incoming.await {
                         Ok(connection) => {
                             let observed_connection = connection.clone();
@@ -194,6 +198,7 @@ impl Server {
             transport_options,
             incoming: Mutex::new(receiver),
             accept_task,
+            connection_tasks,
         })
     }
 
@@ -219,9 +224,10 @@ impl Server {
     }
 
     pub async fn close(&self) {
+        self.accept_task.abort();
+        self.connection_tasks.cancel_and_wait().await;
         self.endpoint.close(0u32.into(), b"server closed");
         self.endpoint.wait_idle().await;
-        self.accept_task.abort();
     }
 }
 

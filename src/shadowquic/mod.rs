@@ -39,6 +39,7 @@ use crate::congestion::{
     connection_congestion_kind,
 };
 use crate::hysteria2::transport::bind_endpoint;
+use crate::tasks::TaskGroup;
 use crate::transport::AdaptiveWindowTask;
 use crate::{Address, Error, Result};
 
@@ -483,6 +484,7 @@ pub struct Server {
     endpoint: Endpoint,
     incoming: Mutex<mpsc::Receiver<Accepted>>,
     accept_task: tokio::task::JoinHandle<()>,
+    connection_tasks: TaskGroup,
     congestion: Arc<RwLock<CongestionConfig>>,
     authentication: Arc<RwLock<ServerAuthentication>>,
     receive_window: Arc<RwLock<u64>>,
@@ -542,6 +544,8 @@ impl Server {
         let accept_receive_window = Arc::clone(&receive_window);
         let zero_rtt = Arc::new(RwLock::new(initial_zero_rtt));
         let accept_zero_rtt = Arc::clone(&zero_rtt);
+        let connection_tasks = TaskGroup::new();
+        let accept_connection_tasks = connection_tasks.clone();
         let accept_task = tokio::spawn(async move {
             while let Some(incoming) = accept_endpoint.accept().await {
                 let sender = sender.clone();
@@ -554,7 +558,7 @@ impl Server {
                     .read()
                     .expect("SQuic receive window lock");
                 let zero_rtt = *accept_zero_rtt.read().expect("SQuic 0-RTT lock");
-                tokio::spawn(async move {
+                accept_connection_tasks.spawn(async move {
                     let connection = async {
                         let connecting = incoming.accept()?;
                         if zero_rtt {
@@ -597,6 +601,7 @@ impl Server {
             endpoint,
             incoming: Mutex::new(receiver),
             accept_task,
+            connection_tasks,
             congestion,
             authentication,
             receive_window,
@@ -647,9 +652,10 @@ impl Server {
     }
 
     pub async fn close(&self) {
+        self.accept_task.abort();
+        self.connection_tasks.cancel_and_wait().await;
         self.endpoint.close(0u32.into(), b"server closed");
         self.endpoint.wait_idle().await;
-        self.accept_task.abort();
     }
 }
 
