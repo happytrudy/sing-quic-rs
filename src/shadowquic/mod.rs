@@ -15,12 +15,14 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
 use quinn::{
-    ClientConfig, Endpoint, ServerConfig, TransportConfig, VarInt, crypto::rustls::QuicClientConfig,
+    ClientConfig, Endpoint, ServerConfig, TransportConfig, VarInt,
+    congestion::{BbrConfig, BrutalConfig, ControllerFactory},
+    crypto::rustls::QuicClientConfig,
 };
 use rustls::{
     ClientConfig as RustlsClientConfig, RootCertStore, ServerConfig as RustlsServerConfig,
@@ -31,13 +33,10 @@ use rustls::{
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
     sync::{Mutex, Notify, OnceCell, mpsc, watch},
+    task::JoinSet,
 };
 
-use crate::congestion::SwitchableCongestionFactory;
-use crate::congestion::{
-    CongestionKind, configure_connection_bbr, configure_connection_brutal_with_options,
-    connection_congestion_kind,
-};
+use crate::congestion::CongestionKind;
 use crate::hysteria2::transport::bind_endpoint;
 use crate::tasks::TaskGroup;
 use crate::transport::AdaptiveWindowTask;
@@ -55,8 +54,14 @@ const SQ_DOMAIN: u8 = 0x03;
 const SQ_IPV6: u8 = 0x04;
 const MAX_DOMAIN_LENGTH: usize = u8::MAX as usize;
 const MAX_CONCURRENT_STREAMS: u32 = 1_000;
-const DATAGRAM_BUFFER_SIZE: usize = 2_500_000;
+const DEFAULT_DATAGRAM_BUFFER_SIZE: usize = 1_048_576;
+const MAX_DATAGRAM_BUFFER_SIZE: usize = 8 * 1024 * 1024;
+const DATAGRAM_BUFFER_SIZE: usize = DEFAULT_DATAGRAM_BUFFER_SIZE;
 const MAX_PENDING_UDP_DATAGRAMS: usize = 1_024;
+const MAX_UDP_DESTINATION_CONTEXTS: usize = 1_024;
+const MAX_UDP_CONTEXT_IDS: usize = 4_096;
+const UDP_CONTEXT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const UDP_CONTEXT_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 const SHADOWQUIC_INITIAL_MTU: u16 = 1_300;
 const SHADOWQUIC_MIN_MTU: u16 = 1_290;
 const SHADOWQUIC_SEND_WINDOW: u64 = 40_000_000;
@@ -84,6 +89,8 @@ pub struct TransportOptions {
     pub keep_alive_period: Option<Duration>,
     pub idle_timeout: Option<Duration>,
     pub disable_path_mtu_discovery: bool,
+    pub datagram_receive_buffer_size: usize,
+    pub datagram_send_buffer_size: usize,
 }
 
 impl Default for TransportOptions {
@@ -96,6 +103,8 @@ impl Default for TransportOptions {
             keep_alive_period: None,
             idle_timeout: Some(Duration::from_secs(30)),
             disable_path_mtu_discovery: false,
+            datagram_receive_buffer_size: DEFAULT_DATAGRAM_BUFFER_SIZE,
+            datagram_send_buffer_size: DEFAULT_DATAGRAM_BUFFER_SIZE,
         }
     }
 }
@@ -133,6 +142,21 @@ struct ClientConnection {
     incoming_udp: Arc<IncomingUdpRegistry>,
     udp_ids: Arc<StdMutex<UdpIdAllocator>>,
     next_udp_owner: Arc<AtomicU64>,
+    receiver_cancel: watch::Sender<bool>,
+}
+
+impl Drop for ClientConnection {
+    fn drop(&mut self) {
+        let _ = self.receiver_cancel.send(true);
+        self.connection
+            .close(0u32.into(), b"SQuic client connection released");
+    }
+}
+
+#[derive(Default)]
+struct ClientConnectionCache {
+    current: Option<Arc<ClientConnection>>,
+    connecting: bool,
 }
 
 #[derive(Debug)]
@@ -183,7 +207,8 @@ pub struct Client {
     congestion: CongestionConfig,
     authentication: ClientAuthentication,
     zero_rtt: bool,
-    connection: Arc<Mutex<Option<Arc<ClientConnection>>>>,
+    connection: Arc<Mutex<ClientConnectionCache>>,
+    connection_changed: Arc<Notify>,
 }
 
 impl Client {
@@ -205,6 +230,7 @@ impl Client {
         let mut config = ClientConfig::new(Arc::new(crypto));
         config.transport_config(Arc::new(shadowquic_client_transport_config(
             options.transport,
+            options.congestion,
         )?));
         let bind = match options.server.ip() {
             IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
@@ -246,6 +272,7 @@ impl Client {
         let mut config = ClientConfig::new(Arc::new(crypto));
         config.transport_config(Arc::new(sunnyquic_client_transport_config(
             options.transport,
+            options.congestion,
         )?));
         let bind = match options.server.ip() {
             IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
@@ -280,17 +307,46 @@ impl Client {
             congestion,
             authentication,
             zero_rtt,
-            connection: Arc::new(Mutex::new(None)),
+            connection: Arc::new(Mutex::new(ClientConnectionCache::default())),
+            connection_changed: Arc::new(Notify::new()),
         }
     }
 
     async fn connection_state(&self) -> Result<Arc<ClientConnection>> {
-        let mut cached = self.connection.lock().await;
-        if let Some(state) = cached.as_ref()
-            && state.connection.close_reason().is_none()
-        {
-            return Ok(Arc::clone(state));
+        loop {
+            let changed = self.connection_changed.notified();
+            let should_connect = {
+                let mut cache = self.connection.lock().await;
+                if let Some(state) = cache.current.as_ref()
+                    && state.connection.close_reason().is_none()
+                {
+                    return Ok(Arc::clone(state));
+                }
+                if cache.connecting {
+                    false
+                } else {
+                    cache.connecting = true;
+                    true
+                }
+            };
+            if !should_connect {
+                changed.await;
+                continue;
+            }
+
+            let result = self.establish_connection().await;
+            let mut cache = self.connection.lock().await;
+            cache.connecting = false;
+            if let Ok(state) = &result {
+                cache.current = Some(Arc::clone(state));
+            }
+            drop(cache);
+            self.connection_changed.notify_waiters();
+            return result;
         }
+    }
+
+    async fn establish_connection(&self) -> Result<Arc<ClientConnection>> {
         let connecting = self.endpoint.connect(self.server, &self.server_name)?;
         let (connection, attempted_0rtt) = if self.zero_rtt {
             match connecting.into_0rtt() {
@@ -300,7 +356,6 @@ impl Client {
         } else {
             (connecting.await?, false)
         };
-        apply_congestion(&connection, self.congestion)?;
         if attempted_0rtt {
             let validation_connection = connection.clone();
             let authentication = self.authentication;
@@ -326,15 +381,20 @@ impl Client {
                     .map_err(|error| Error::Protocol(error.to_string()))?;
             }
         }
-        let state = Arc::new(ClientConnection {
+        let incoming_udp = Arc::new(IncomingUdpRegistry::default());
+        let (receiver_cancel, receiver_cancelled) = watch::channel(false);
+        spawn_client_udp_receiver(
+            connection.clone(),
+            Arc::clone(&incoming_udp),
+            receiver_cancelled,
+        );
+        Ok(Arc::new(ClientConnection {
             connection,
-            incoming_udp: Arc::new(IncomingUdpRegistry::default()),
+            incoming_udp,
             udp_ids: Arc::new(StdMutex::new(UdpIdAllocator::default())),
             next_udp_owner: Arc::new(AtomicU64::new(1)),
-        });
-        spawn_client_udp_receiver(Arc::clone(&state));
-        *cached = Some(Arc::clone(&state));
-        Ok(state)
+            receiver_cancel,
+        }))
     }
 
     #[cfg(test)]
@@ -343,7 +403,6 @@ impl Client {
             .endpoint
             .connect(self.server, &self.server_name)?
             .await?;
-        apply_congestion(&connection, self.congestion)?;
         if matches!(self.authentication, ClientAuthentication::Jls) {
             validate_jls_connection(&connection)?;
         }
@@ -377,9 +436,16 @@ impl Client {
         let (packet_sender, packet_receiver) = mpsc::channel(256);
         let incoming_udp = Arc::clone(&state.incoming_udp);
         let owner = state.next_udp_owner.fetch_add(1, Ordering::Relaxed);
+        let (control_cancel, control_cancelled) = watch::channel(false);
         tokio::spawn(async move {
-            if let Err(error) =
-                handle_udp_control_stream(recv, incoming_udp, packet_sender, owner).await
+            if let Err(error) = handle_udp_control_stream(
+                recv,
+                incoming_udp,
+                packet_sender,
+                owner,
+                control_cancelled,
+            )
+            .await
             {
                 tracing::debug!(%error, "SQuic UDP control stream closed");
             }
@@ -396,8 +462,9 @@ impl Client {
             incoming: Mutex::new(packet_receiver),
             outgoing: OutgoingUdpState {
                 control: Mutex::new(send),
-                contexts: Mutex::new(HashMap::new()),
+                contexts: Mutex::new(OutgoingUdpContexts::default()),
             },
+            control_cancel,
         }))
     }
 
@@ -406,14 +473,22 @@ impl Client {
     }
 
     pub async fn congestion_kind(&self) -> Option<CongestionKind> {
-        let connection = self.connection.lock().await;
-        connection
+        let cache = self.connection.lock().await;
+        cache
+            .current
             .as_ref()
-            .and_then(|state| connection_congestion_kind(&state.connection))
+            .filter(|state| state.connection.close_reason().is_none())
+            .map(|_| congestion_kind(self.congestion))
     }
 
     pub fn close(&self) {
         self.endpoint.close(0u32.into(), b"client closed");
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.endpoint.close(0u32.into(), b"client dropped");
     }
 }
 
@@ -511,6 +586,7 @@ impl Server {
             options.private_key,
             options.zero_rtt,
             options.transport,
+            options.congestion,
         )?;
         let authentication = ServerAuthentication::Sunny(Arc::new(sunny_users(&options.users)));
         Self::bind_inner(
@@ -573,16 +649,12 @@ impl Server {
                     .await;
                     match connection {
                         Ok(connection) => {
-                            if let Err(error) = apply_congestion(&connection, congestion) {
-                                connection.close(0u32.into(), b"congestion control failed");
-                                tracing::debug!(%error, %protocol, "SQuic congestion setup failed");
-                                return;
-                            }
                             if let Err(error) = serve_connection(
                                 connection,
                                 sender,
                                 authentication,
                                 protocol,
+                                congestion,
                                 receive_window,
                             )
                             .await
@@ -635,6 +707,7 @@ impl Server {
             options.private_key,
             options.zero_rtt,
             options.transport,
+            options.congestion,
         )?;
         *self.congestion.write().expect("SQuic congestion lock") = options.congestion;
         *self
@@ -659,22 +732,28 @@ impl Server {
     }
 }
 
-fn apply_congestion(connection: &quinn::Connection, congestion: CongestionConfig) -> Result<()> {
-    let configured = match congestion {
-        CongestionConfig::Bbr => configure_connection_bbr(connection),
+fn congestion_kind(congestion: CongestionConfig) -> CongestionKind {
+    match congestion {
+        CongestionConfig::Bbr => CongestionKind::Bbr,
+        CongestionConfig::Brutal {
+            bytes_per_second, ..
+        } => CongestionKind::Brutal { bytes_per_second },
+    }
+}
+
+fn congestion_factory(
+    congestion: CongestionConfig,
+) -> Arc<dyn ControllerFactory + Send + Sync + 'static> {
+    match congestion {
+        CongestionConfig::Bbr => Arc::new(BbrConfig::default()),
         CongestionConfig::Brutal {
             bytes_per_second,
             disable_loss_compensation,
-        } => configure_connection_brutal_with_options(
-            connection,
-            bytes_per_second,
-            disable_loss_compensation,
-        ),
-    };
-    if configured {
-        Ok(())
-    } else {
-        Err(Error::CongestionControl)
+        } => {
+            let mut config = BrutalConfig::new(bytes_per_second);
+            config.loss_compensation(!disable_loss_compensation);
+            Arc::new(config)
+        }
     }
 }
 
@@ -712,24 +791,29 @@ async fn wait_for_sunny_auth(
     }
 }
 
-fn spawn_client_udp_receiver(state: Arc<ClientConnection>) {
+fn spawn_client_udp_receiver(
+    connection: quinn::Connection,
+    incoming_udp: Arc<IncomingUdpRegistry>,
+    mut cancel: watch::Receiver<bool>,
+) {
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                datagram = state.connection.read_datagram() => match datagram {
+                _ = cancel.changed() => break,
+                datagram = connection.read_datagram() => match datagram {
                     Ok(datagram) => {
                         if let Err(error) = handle_incoming_udp_datagram(
                             datagram,
-                            Arc::clone(&state.incoming_udp),
+                            Arc::clone(&incoming_udp),
                         ).await {
                             tracing::debug!(%error, "SQuic client UDP datagram dropped");
                         }
                     }
                     Err(error) => break tracing::debug!(%error, "SQuic client datagram receiver stopped"),
                 },
-                stream = state.connection.accept_uni() => match stream {
+                stream = connection.accept_uni() => match stream {
                     Ok(stream) => {
-                        let incoming_udp = Arc::clone(&state.incoming_udp);
+                        let incoming_udp = Arc::clone(&incoming_udp);
                         tokio::spawn(async move {
                             if let Err(error) = handle_incoming_udp_stream(stream, incoming_udp).await {
                                 tracing::debug!(%error, "SQuic client UDP stream closed");
@@ -740,29 +824,13 @@ fn spawn_client_udp_receiver(state: Arc<ClientConnection>) {
                 },
             }
         }
-        state.incoming_udp.close();
+        incoming_udp.close().await;
     });
 }
 
-fn shadowquic_client_transport_config(options: TransportOptions) -> Result<TransportConfig> {
-    protocol_transport_config(
-        options.initial_packet_size,
-        options.max_concurrent_streams,
-        options.connection_receive_window,
-        options.stream_receive_window,
-        options.keep_alive_period,
-        options.idle_timeout,
-        options.disable_path_mtu_discovery,
-        SHADOWQUIC_SEND_WINDOW,
-    )
-}
-
-fn shadowquic_server_transport_config(options: TransportOptions) -> Result<TransportConfig> {
-    shadowquic_client_transport_config(options)
-}
-
-fn sunnyquic_client_transport_config(
-    options: crate::sunnyquic::TransportOptions,
+fn shadowquic_client_transport_config(
+    options: TransportOptions,
+    congestion: CongestionConfig,
 ) -> Result<TransportConfig> {
     protocol_transport_config(
         options.initial_packet_size,
@@ -772,14 +840,44 @@ fn sunnyquic_client_transport_config(
         options.keep_alive_period,
         options.idle_timeout,
         options.disable_path_mtu_discovery,
+        options.datagram_receive_buffer_size,
+        options.datagram_send_buffer_size,
+        SHADOWQUIC_SEND_WINDOW,
+        congestion,
+    )
+}
+
+fn shadowquic_server_transport_config(
+    options: TransportOptions,
+    congestion: CongestionConfig,
+) -> Result<TransportConfig> {
+    shadowquic_client_transport_config(options, congestion)
+}
+
+fn sunnyquic_client_transport_config(
+    options: crate::sunnyquic::TransportOptions,
+    congestion: CongestionConfig,
+) -> Result<TransportConfig> {
+    protocol_transport_config(
+        options.initial_packet_size,
+        options.max_concurrent_streams,
+        options.connection_receive_window,
+        options.stream_receive_window,
+        options.keep_alive_period,
+        options.idle_timeout,
+        options.disable_path_mtu_discovery,
+        DEFAULT_DATAGRAM_BUFFER_SIZE,
+        DEFAULT_DATAGRAM_BUFFER_SIZE,
         SUNNYQUIC_SEND_WINDOW,
+        congestion,
     )
 }
 
 fn sunnyquic_server_transport_config(
     options: crate::sunnyquic::TransportOptions,
+    congestion: CongestionConfig,
 ) -> Result<TransportConfig> {
-    sunnyquic_client_transport_config(options)
+    sunnyquic_client_transport_config(options, congestion)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -791,12 +889,22 @@ fn protocol_transport_config(
     keep_alive_period: Option<Duration>,
     idle_timeout: Option<Duration>,
     disable_path_mtu_discovery: bool,
+    datagram_receive_buffer_size: usize,
+    datagram_send_buffer_size: usize,
     send_window: u64,
+    congestion: CongestionConfig,
 ) -> Result<TransportConfig> {
     if initial_packet_size < 1_200 {
         return Err(Error::Protocol(
             "SQuic initial_packet_size must be at least 1200".into(),
         ));
+    }
+    if datagram_receive_buffer_size > MAX_DATAGRAM_BUFFER_SIZE
+        || datagram_send_buffer_size > MAX_DATAGRAM_BUFFER_SIZE
+    {
+        return Err(Error::Protocol(format!(
+            "SQuic datagram buffer size must not exceed {MAX_DATAGRAM_BUFFER_SIZE} bytes"
+        )));
     }
     let max_concurrent_streams = VarInt::from_u64(max_concurrent_streams)
         .map_err(|_| Error::Protocol("SQuic max_concurrent_streams is too large".into()))?;
@@ -813,14 +921,16 @@ fn protocol_transport_config(
         .transpose()?;
     let mut transport = TransportConfig::default();
     transport
-        .congestion_controller_factory(Arc::new(SwitchableCongestionFactory))
+        .congestion_controller_factory(congestion_factory(congestion))
         .max_concurrent_bidi_streams(max_concurrent_streams)
         .max_concurrent_uni_streams(max_concurrent_streams)
         .receive_window(connection_receive_window)
         .stream_receive_window(stream_receive_window)
         .send_window(send_window)
-        .datagram_receive_buffer_size(Some(DATAGRAM_BUFFER_SIZE))
-        .datagram_send_buffer_size(DATAGRAM_BUFFER_SIZE)
+        .datagram_receive_buffer_size(
+            (datagram_receive_buffer_size > 0).then_some(datagram_receive_buffer_size),
+        )
+        .datagram_send_buffer_size(datagram_send_buffer_size)
         .max_idle_timeout(idle_timeout)
         .keep_alive_interval(keep_alive_period)
         .min_mtu(initial_packet_size.min(SHADOWQUIC_MIN_MTU))
@@ -861,6 +971,7 @@ fn build_server_config(options: &ServerOptions) -> Result<ServerConfig> {
     let mut config = ServerConfig::with_crypto(Arc::new(crypto));
     config.transport_config(Arc::new(shadowquic_server_transport_config(
         options.transport,
+        options.congestion,
     )?));
     Ok(config)
 }
@@ -870,6 +981,7 @@ fn build_sunny_server_config(
     private_key: Vec<u8>,
     zero_rtt: bool,
     transport: crate::sunnyquic::TransportOptions,
+    congestion: CongestionConfig,
 ) -> Result<ServerConfig> {
     let certificates = certificate_chain
         .into_iter()
@@ -884,7 +996,9 @@ fn build_sunny_server_config(
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
         .map_err(|error| Error::QuicTls(error.to_string()))?;
     let mut config = ServerConfig::with_crypto(Arc::new(crypto));
-    config.transport_config(Arc::new(sunnyquic_server_transport_config(transport)?));
+    config.transport_config(Arc::new(sunnyquic_server_transport_config(
+        transport, congestion,
+    )?));
     Ok(config)
 }
 
@@ -961,6 +1075,9 @@ impl IncomingUdpRegistry {
         sender: mpsc::Sender<ShadowQuicPacket>,
     ) -> Result<()> {
         let mut state = self.state.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
         if state.routes.contains_key(&id) {
             return Err(Error::Protocol(format!(
                 "duplicate SQuic UDP association id {id}"
@@ -1015,6 +1132,9 @@ impl IncomingUdpRegistry {
     }
 
     async fn route_datagram(&self, datagram: Bytes) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
         if datagram.len() < 2 {
             return Err(Error::Protocol("truncated ShadowQuic UDP datagram".into()));
         }
@@ -1050,8 +1170,14 @@ impl IncomingUdpRegistry {
         Ok(())
     }
 
-    fn close(&self) {
+    async fn close(&self) {
         self.closed.store(true, Ordering::Release);
+        let mut state = self.state.lock().await;
+        state.routes.clear();
+        state.pending.clear();
+        state.pending_datagrams = 0;
+        state.pending_bytes = 0;
+        drop(state);
         self.changed.notify_waiters();
     }
 }
@@ -1088,9 +1214,30 @@ enum OutgoingUdpContext {
 }
 
 #[derive(Debug)]
+struct OutgoingUdpContextEntry {
+    cell: Arc<OnceCell<OutgoingUdpContext>>,
+    last_used: Instant,
+}
+
+#[derive(Debug)]
+struct OutgoingUdpContexts {
+    entries: HashMap<Address, OutgoingUdpContextEntry>,
+    next_cleanup: Instant,
+}
+
+impl Default for OutgoingUdpContexts {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            next_cleanup: Instant::now() + UDP_CONTEXT_CLEANUP_INTERVAL,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct OutgoingUdpState {
     control: Mutex<quinn::SendStream>,
-    contexts: Mutex<HashMap<Address, Arc<OnceCell<OutgoingUdpContext>>>>,
+    contexts: Mutex<OutgoingUdpContexts>,
 }
 
 #[derive(Debug)]
@@ -1101,20 +1248,23 @@ pub struct ShadowQuicPacketConnection {
     allocated_ids: StdMutex<Vec<u16>>,
     incoming: Mutex<mpsc::Receiver<ShadowQuicPacket>>,
     outgoing: OutgoingUdpState,
+    control_cancel: watch::Sender<bool>,
 }
 
 impl ShadowQuicPacketConnection {
     pub async fn send(&self, packet: ShadowQuicPacket) -> Result<()> {
-        let context_slot = {
-            let mut contexts = self.outgoing.contexts.lock().await;
-            contexts
-                .entry(packet.destination.clone())
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
-        };
+        let destination = packet.destination.clone();
+        let context_slot = self.context_slot(&destination).await?;
         let context = context_slot
-            .get_or_try_init(|| self.create_udp_context(&packet.destination))
-            .await?;
+            .get_or_try_init(|| self.create_udp_context(&destination))
+            .await;
+        let context = match context {
+            Ok(context) => context,
+            Err(error) => {
+                self.remove_context(&destination, &context_slot).await;
+                return Err(error);
+            }
+        };
 
         match context {
             OutgoingUdpContext::Datagram { id } => {
@@ -1129,48 +1279,121 @@ impl ShadowQuicPacketConnection {
                 let length = u16::try_from(packet.data.len()).map_err(|_| {
                     Error::Protocol("ShadowQuic UDP packet exceeds 65535 bytes".into())
                 })?;
-                let mut stream = stream.lock().await;
-                stream.write_all(&length.to_be_bytes()).await?;
-                stream.write_all(&packet.data).await?;
-                stream.flush().await?;
+                let result = async {
+                    let mut stream = stream.lock().await;
+                    stream.write_all(&length.to_be_bytes()).await?;
+                    stream.write_all(&packet.data).await?;
+                    stream.flush().await?;
+                    Ok::<_, Error>(())
+                }
+                .await;
+                if result.is_err() {
+                    self.remove_context(&destination, &context_slot).await;
+                }
+                result?;
             }
         }
         Ok(())
     }
 
+    async fn context_slot(
+        &self,
+        destination: &Address,
+    ) -> Result<Arc<OnceCell<OutgoingUdpContext>>> {
+        let now = Instant::now();
+        let mut contexts = self.outgoing.contexts.lock().await;
+        if now >= contexts.next_cleanup {
+            contexts.entries.retain(|_, entry| {
+                now.saturating_duration_since(entry.last_used) < UDP_CONTEXT_IDLE_TIMEOUT
+                    || Arc::strong_count(&entry.cell) > 1
+            });
+            contexts.next_cleanup = now + UDP_CONTEXT_CLEANUP_INTERVAL;
+        }
+        if let Some(entry) = contexts.entries.get_mut(destination) {
+            entry.last_used = now;
+            return Ok(Arc::clone(&entry.cell));
+        }
+        if self
+            .allocated_ids
+            .lock()
+            .expect("SQuic allocated UDP id lock")
+            .len()
+            >= MAX_UDP_CONTEXT_IDS
+        {
+            return Err(Error::Protocol(
+                "SQuic UDP destination context limit reached".into(),
+            ));
+        }
+        if contexts.entries.len() >= MAX_UDP_DESTINATION_CONTEXTS {
+            let candidate = contexts
+                .entries
+                .iter()
+                .filter(|(_, entry)| Arc::strong_count(&entry.cell) == 1)
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(address, _)| address.clone());
+            if let Some(address) = candidate {
+                contexts.entries.remove(&address);
+            } else {
+                return Err(Error::Protocol(
+                    "SQuic UDP destination context limit reached".into(),
+                ));
+            }
+        }
+        let cell = Arc::new(OnceCell::new());
+        contexts.entries.insert(
+            destination.clone(),
+            OutgoingUdpContextEntry {
+                cell: Arc::clone(&cell),
+                last_used: now,
+            },
+        );
+        Ok(cell)
+    }
+
+    async fn remove_context(
+        &self,
+        destination: &Address,
+        expected: &Arc<OnceCell<OutgoingUdpContext>>,
+    ) {
+        let mut contexts = self.outgoing.contexts.lock().await;
+        if contexts
+            .entries
+            .get(destination)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.cell, expected))
+        {
+            contexts.entries.remove(destination);
+        }
+    }
+
     async fn create_udp_context(&self, destination: &Address) -> Result<OutgoingUdpContext> {
         let address = encode_address(destination)?;
         let id = self.udp_ids.lock().expect("SQuic UDP id lock").allocate()?;
-        let result = async {
-            let mut control = self.outgoing.control.lock().await;
-            control.write_all(&address).await?;
-            control.write_all(&id.to_be_bytes()).await?;
-            control.flush().await?;
-            Ok::<_, Error>(match self.mode {
-                UdpMode::Datagram => OutgoingUdpContext::Datagram { id },
-                UdpMode::Stream => {
-                    let mut stream = self.connection.open_uni().await?;
+        self.allocated_ids
+            .lock()
+            .expect("SQuic allocated UDP id lock")
+            .push(id);
+        async {
+            let stream = match self.mode {
+                UdpMode::Datagram => None,
+                UdpMode::Stream => Some(self.connection.open_uni().await?),
+            };
+            {
+                let mut control = self.outgoing.control.lock().await;
+                control.write_all(&address).await?;
+                control.write_all(&id.to_be_bytes()).await?;
+                control.flush().await?;
+            }
+            Ok::<_, Error>(match stream {
+                Some(mut stream) => {
                     stream.write_all(&id.to_be_bytes()).await?;
                     OutgoingUdpContext::Stream {
                         stream: Mutex::new(stream),
                     }
                 }
+                None => OutgoingUdpContext::Datagram { id },
             })
         }
-        .await;
-        match result {
-            Ok(context) => {
-                self.allocated_ids
-                    .lock()
-                    .expect("SQuic allocated UDP id lock")
-                    .push(id);
-                Ok(context)
-            }
-            Err(error) => {
-                self.udp_ids.lock().expect("SQuic UDP id lock").release(id);
-                Err(error)
-            }
-        }
+        .await
     }
 
     pub async fn recv(&self) -> Result<ShadowQuicPacket> {
@@ -1180,6 +1403,7 @@ impl ShadowQuicPacketConnection {
 
 impl Drop for ShadowQuicPacketConnection {
     fn drop(&mut self) {
+        let _ = self.control_cancel.send(true);
         let ids = self
             .allocated_ids
             .get_mut()
@@ -1197,6 +1421,7 @@ async fn serve_connection(
     sender: mpsc::Sender<Accepted>,
     authentication: ServerAuthentication,
     protocol: &'static str,
+    configured_congestion: CongestionConfig,
     receive_window: u64,
 ) -> Result<()> {
     let source = connection.remote_address();
@@ -1204,7 +1429,7 @@ async fn serve_connection(
         ServerAuthentication::Jls => authenticated_jls_user(&connection).await?,
         ServerAuthentication::Sunny(_) => String::new(),
     };
-    let congestion = connection_congestion_kind(&connection).ok_or(Error::CongestionControl)?;
+    let congestion = congestion_kind(configured_congestion);
     let send_rate = match congestion {
         CongestionKind::Brutal { bytes_per_second } => bytes_per_second,
         CongestionKind::Bbr => 0,
@@ -1231,6 +1456,7 @@ async fn serve_connection(
     let (auth_sender, mut auth_receiver) = watch::channel(None);
     let mut pending_auth_datagrams: VecDeque<Bytes> = VecDeque::new();
     let mut pending_auth_bytes = 0usize;
+    let mut stream_tasks = JoinSet::new();
 
     let result = loop {
         tokio::select! {
@@ -1266,7 +1492,7 @@ async fn serve_connection(
                     let incoming_udp = Arc::clone(&incoming_udp);
                     let udp_ids = Arc::clone(&udp_ids);
                     let next_udp_owner = Arc::clone(&next_udp_owner);
-                    tokio::spawn(async move {
+                    stream_tasks.spawn(async move {
                         if let Err(error) = handle_bi_stream(
                             connection,
                             send,
@@ -1292,7 +1518,7 @@ async fn serve_connection(
                     let incoming_udp = Arc::clone(&incoming_udp);
                     let authentication = authentication.clone();
                     let auth_receiver = auth_receiver.clone();
-                    tokio::spawn(async move {
+                    stream_tasks.spawn(async move {
                         let result = async {
                             wait_for_sunny_auth(&authentication, auth_receiver).await?;
                             handle_incoming_udp_stream(recv, incoming_udp).await
@@ -1304,6 +1530,11 @@ async fn serve_connection(
                     });
                 }
                 Err(error) => break Err(error.into()),
+            },
+            completed = stream_tasks.join_next(), if !stream_tasks.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    tracing::debug!(%error, %protocol, "SQuic stream task failed");
+                }
             },
             datagram = connection.read_datagram() => match datagram {
                 Ok(datagram) => {
@@ -1328,7 +1559,9 @@ async fn serve_connection(
             },
         }
     };
-    incoming_udp.close();
+    stream_tasks.abort_all();
+    while stream_tasks.join_next().await.is_some() {}
+    incoming_udp.close().await;
     result
 }
 
@@ -1419,6 +1652,7 @@ async fn handle_bi_stream(
             };
             let (packet_sender, packet_receiver) = mpsc::channel(256);
             let owner = next_udp_owner.fetch_add(1, Ordering::Relaxed);
+            let (control_cancel, control_cancelled) = watch::channel(false);
             let packet_connection = Arc::new(ShadowQuicPacketConnection {
                 connection,
                 mode,
@@ -1427,8 +1661,9 @@ async fn handle_bi_stream(
                 incoming: Mutex::new(packet_receiver),
                 outgoing: OutgoingUdpState {
                     control: Mutex::new(send),
-                    contexts: Mutex::new(HashMap::new()),
+                    contexts: Mutex::new(OutgoingUdpContexts::default()),
                 },
+                control_cancel,
             });
             sender
                 .send(Accepted::Packet(AcceptedPacket {
@@ -1443,7 +1678,8 @@ async fn handle_bi_stream(
                 }))
                 .await
                 .map_err(|_| Error::Closed)?;
-            handle_udp_control_stream(recv, incoming_udp, packet_sender, owner).await?;
+            handle_udp_control_stream(recv, incoming_udp, packet_sender, owner, control_cancelled)
+                .await?;
         }
         SQ_EXTENSION => {
             wait_for_sunny_auth(&authentication, auth_receiver).await?;
@@ -1496,18 +1732,32 @@ async fn handle_udp_control_stream(
     incoming_udp: Arc<IncomingUdpRegistry>,
     sender: mpsc::Sender<ShadowQuicPacket>,
     owner: u64,
+    mut cancel: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut ids = Vec::new();
     let result = async {
         loop {
-            let destination = decode_address(&mut recv).await?;
-            let mut id = [0u8; 2];
-            recv.read_exact(&mut id).await?;
-            let id = u16::from_be_bytes(id);
-            incoming_udp
-                .register(owner, id, destination, sender.clone())
-                .await?;
-            ids.push(id);
+            if *cancel.borrow() {
+                break;
+            }
+            let registration = async {
+                let destination = decode_address(&mut recv).await?;
+                let mut id = [0u8; 2];
+                recv.read_exact(&mut id).await?;
+                let id = u16::from_be_bytes(id);
+                incoming_udp
+                    .register(owner, id, destination, sender.clone())
+                    .await?;
+                Ok::<u16, Error>(id)
+            };
+            tokio::select! {
+                changed = cancel.changed() => {
+                    if changed.is_err() || *cancel.borrow() {
+                        break;
+                    }
+                }
+                id = registration => ids.push(id?),
+            }
         }
         #[allow(unreachable_code)]
         Ok::<(), Error>(())
@@ -1713,7 +1963,8 @@ mod tests {
         let crypto = QuicClientConfig::try_from(tls).unwrap();
         let mut config = ClientConfig::new(Arc::new(crypto));
         config.transport_config(Arc::new(
-            shadowquic_client_transport_config(TransportOptions::default()).unwrap(),
+            shadowquic_client_transport_config(TransportOptions::default(), CongestionConfig::Bbr)
+                .unwrap(),
         ));
         let endpoint = bind_endpoint("127.0.0.1:0".parse().unwrap(), None).unwrap();
         endpoint.set_default_client_config(config);
@@ -1760,6 +2011,31 @@ mod tests {
         let state = registry.state.lock().await;
         assert_eq!(state.pending_datagrams, MAX_PENDING_UDP_DATAGRAMS);
         assert!(state.pending_bytes <= DATAGRAM_BUFFER_SIZE);
+    }
+
+    #[tokio::test]
+    async fn closing_udp_registry_releases_routes_and_pending_datagrams() {
+        let registry = IncomingUdpRegistry::default();
+        let destination = Address::new("1.1.1.1", 53).unwrap();
+        let (sender, _receiver) = mpsc::channel(1);
+        registry.register(1, 7, destination, sender).await.unwrap();
+        registry
+            .route_datagram(Bytes::from(vec![0, 8, b'p']))
+            .await
+            .unwrap();
+        registry.close().await;
+        let state = registry.state.lock().await;
+        assert!(state.routes.is_empty());
+        assert!(state.pending.is_empty());
+        assert_eq!(state.pending_datagrams, 0);
+        assert_eq!(state.pending_bytes, 0);
+        drop(state);
+        assert!(
+            registry
+                .route_datagram(Bytes::from(vec![0, 9, b'p']))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
