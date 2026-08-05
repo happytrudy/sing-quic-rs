@@ -30,7 +30,7 @@ use rustls::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
-    sync::{Mutex, Notify, mpsc, watch},
+    sync::{Mutex, Notify, OnceCell, mpsc, watch},
 };
 
 use crate::congestion::SwitchableCongestionFactory;
@@ -394,10 +394,10 @@ impl Client {
             udp_ids: Arc::clone(&state.udp_ids),
             allocated_ids: StdMutex::new(Vec::new()),
             incoming: Mutex::new(packet_receiver),
-            outgoing: Mutex::new(OutgoingUdpState {
-                control: send,
-                contexts: HashMap::new(),
-            }),
+            outgoing: OutgoingUdpState {
+                control: Mutex::new(send),
+                contexts: Mutex::new(HashMap::new()),
+            },
         }))
     }
 
@@ -1084,13 +1084,13 @@ impl UdpIdAllocator {
 #[derive(Debug)]
 enum OutgoingUdpContext {
     Datagram { id: u16 },
-    Stream { stream: quinn::SendStream },
+    Stream { stream: Mutex<quinn::SendStream> },
 }
 
 #[derive(Debug)]
 struct OutgoingUdpState {
-    control: quinn::SendStream,
-    contexts: HashMap<Address, OutgoingUdpContext>,
+    control: Mutex<quinn::SendStream>,
+    contexts: Mutex<HashMap<Address, Arc<OnceCell<OutgoingUdpContext>>>>,
 }
 
 #[derive(Debug)]
@@ -1100,50 +1100,23 @@ pub struct ShadowQuicPacketConnection {
     udp_ids: Arc<StdMutex<UdpIdAllocator>>,
     allocated_ids: StdMutex<Vec<u16>>,
     incoming: Mutex<mpsc::Receiver<ShadowQuicPacket>>,
-    outgoing: Mutex<OutgoingUdpState>,
+    outgoing: OutgoingUdpState,
 }
 
 impl ShadowQuicPacketConnection {
     pub async fn send(&self, packet: ShadowQuicPacket) -> Result<()> {
-        let mut outgoing = self.outgoing.lock().await;
-        if !outgoing.contexts.contains_key(&packet.destination) {
-            let address = encode_address(&packet.destination)?;
-            let id = self.udp_ids.lock().expect("SQuic UDP id lock").allocate()?;
-            let context = async {
-                outgoing.control.write_all(&address).await?;
-                outgoing.control.write_all(&id.to_be_bytes()).await?;
-                outgoing.control.flush().await?;
-                Ok::<_, Error>(match self.mode {
-                    UdpMode::Datagram => OutgoingUdpContext::Datagram { id },
-                    UdpMode::Stream => {
-                        let mut stream = self.connection.open_uni().await?;
-                        stream.write_all(&id.to_be_bytes()).await?;
-                        OutgoingUdpContext::Stream { stream }
-                    }
-                })
-            }
-            .await;
-            let context = match context {
-                Ok(context) => context,
-                Err(error) => {
-                    self.udp_ids.lock().expect("SQuic UDP id lock").release(id);
-                    return Err(error);
-                }
-            };
-            self.allocated_ids
-                .lock()
-                .expect("SQuic allocated UDP id lock")
-                .push(id);
-            outgoing
-                .contexts
-                .insert(packet.destination.clone(), context);
-        }
+        let context_slot = {
+            let mut contexts = self.outgoing.contexts.lock().await;
+            contexts
+                .entry(packet.destination.clone())
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+        let context = context_slot
+            .get_or_try_init(|| self.create_udp_context(&packet.destination))
+            .await?;
 
-        match outgoing
-            .contexts
-            .get_mut(&packet.destination)
-            .expect("ShadowQuic UDP context inserted")
-        {
+        match context {
             OutgoingUdpContext::Datagram { id } => {
                 let mut frame = Vec::with_capacity(packet.data.len() + 2);
                 frame.extend_from_slice(&id.to_be_bytes());
@@ -1156,12 +1129,48 @@ impl ShadowQuicPacketConnection {
                 let length = u16::try_from(packet.data.len()).map_err(|_| {
                     Error::Protocol("ShadowQuic UDP packet exceeds 65535 bytes".into())
                 })?;
+                let mut stream = stream.lock().await;
                 stream.write_all(&length.to_be_bytes()).await?;
                 stream.write_all(&packet.data).await?;
                 stream.flush().await?;
             }
         }
         Ok(())
+    }
+
+    async fn create_udp_context(&self, destination: &Address) -> Result<OutgoingUdpContext> {
+        let address = encode_address(destination)?;
+        let id = self.udp_ids.lock().expect("SQuic UDP id lock").allocate()?;
+        let result = async {
+            let mut control = self.outgoing.control.lock().await;
+            control.write_all(&address).await?;
+            control.write_all(&id.to_be_bytes()).await?;
+            control.flush().await?;
+            Ok::<_, Error>(match self.mode {
+                UdpMode::Datagram => OutgoingUdpContext::Datagram { id },
+                UdpMode::Stream => {
+                    let mut stream = self.connection.open_uni().await?;
+                    stream.write_all(&id.to_be_bytes()).await?;
+                    OutgoingUdpContext::Stream {
+                        stream: Mutex::new(stream),
+                    }
+                }
+            })
+        }
+        .await;
+        match result {
+            Ok(context) => {
+                self.allocated_ids
+                    .lock()
+                    .expect("SQuic allocated UDP id lock")
+                    .push(id);
+                Ok(context)
+            }
+            Err(error) => {
+                self.udp_ids.lock().expect("SQuic UDP id lock").release(id);
+                Err(error)
+            }
+        }
     }
 
     pub async fn recv(&self) -> Result<ShadowQuicPacket> {
@@ -1416,10 +1425,10 @@ async fn handle_bi_stream(
                 udp_ids,
                 allocated_ids: StdMutex::new(Vec::new()),
                 incoming: Mutex::new(packet_receiver),
-                outgoing: Mutex::new(OutgoingUdpState {
-                    control: send,
-                    contexts: HashMap::new(),
-                }),
+                outgoing: OutgoingUdpState {
+                    control: Mutex::new(send),
+                    contexts: Mutex::new(HashMap::new()),
+                },
             });
             sender
                 .send(Accepted::Packet(AcceptedPacket {
