@@ -16,6 +16,8 @@ const UDP_HEADER_SIZE: usize = 8;
 const MAX_UDP_SIZE: usize = 4096;
 const MAX_ADDRESS_LENGTH: usize = 2048;
 const FRAGMENT_LIFETIME: Duration = Duration::from_secs(10);
+const MAX_FRAGMENT_SETS: usize = 256;
+const MAX_FRAGMENT_BYTES: usize = 1024 * 1024;
 const INITIAL_UDP_MTU: usize = 1200 - 3;
 
 #[derive(Debug)]
@@ -40,53 +42,95 @@ struct FragmentSet {
     destination: Address,
     parts: Vec<Option<Vec<u8>>>,
     received: usize,
+    bytes: usize,
 }
 
 #[derive(Debug, Default)]
 struct Defragger {
     fragments: HashMap<u16, FragmentSet>,
+    bytes: usize,
 }
 
 impl Defragger {
     fn feed(&mut self, message: UdpMessage) -> Result<Option<Hysteria2Packet>> {
-        if message.fragment_total <= 1 {
+        self.expire(Instant::now());
+        if message.fragment_total == 0 || message.fragment_id >= message.fragment_total {
+            return Ok(None);
+        }
+        if message.data.len() > MAX_UDP_SIZE {
+            return Err(Error::Protocol(
+                "Hysteria2 UDP packet exceeds 4096 bytes".into(),
+            ));
+        }
+        if message.fragment_total == 1 {
             return Ok(Some(Hysteria2Packet {
                 data: message.data,
                 destination: message.destination,
             }));
         }
-        if message.fragment_id >= message.fragment_total {
-            return Ok(None);
-        }
-
         let now = Instant::now();
-        self.fragments
-            .retain(|_, fragment| now.duration_since(fragment.updated_at) <= FRAGMENT_LIFETIME);
         let total = usize::from(message.fragment_total);
         let fragment_id = usize::from(message.fragment_id);
-        let fragment = self
-            .fragments
-            .entry(message.packet_id)
-            .or_insert_with(|| FragmentSet {
-                updated_at: now,
-                destination: message.destination.clone(),
-                parts: (0..total).map(|_| None).collect(),
-                received: 0,
-            });
-        if fragment.parts.len() != total {
-            *fragment = FragmentSet {
-                updated_at: now,
-                destination: message.destination.clone(),
-                parts: (0..total).map(|_| None).collect(),
-                received: 0,
-            };
+        if !self.fragments.contains_key(&message.packet_id) {
+            if self.fragments.len() >= MAX_FRAGMENT_SETS
+                || self.bytes.saturating_add(message.data.len()) > MAX_FRAGMENT_BYTES
+            {
+                return Ok(None);
+            }
+            self.fragments.insert(
+                message.packet_id,
+                FragmentSet {
+                    updated_at: now,
+                    destination: message.destination.clone(),
+                    parts: (0..total).map(|_| None).collect(),
+                    received: 0,
+                    bytes: 0,
+                },
+            );
         }
-        fragment.updated_at = now;
-        if fragment.parts[fragment_id].is_none() {
-            fragment.parts[fragment_id] = Some(message.data);
-            fragment.received += 1;
+        let (received, empty) = {
+            let fragment = self
+                .fragments
+                .get_mut(&message.packet_id)
+                .expect("inserted fragment set");
+            if fragment.parts.len() != total {
+                self.bytes = self.bytes.saturating_sub(fragment.bytes);
+                *fragment = FragmentSet {
+                    updated_at: now,
+                    destination: message.destination.clone(),
+                    parts: (0..total).map(|_| None).collect(),
+                    received: 0,
+                    bytes: 0,
+                };
+            }
+            fragment.updated_at = now;
+            if fragment.parts[fragment_id].is_none() {
+                if fragment.bytes.saturating_add(message.data.len()) > MAX_UDP_SIZE {
+                    let discarded = fragment.bytes;
+                    self.fragments.remove(&message.packet_id);
+                    self.bytes = self.bytes.saturating_sub(discarded);
+                    return Ok(None);
+                }
+                if self.bytes.saturating_add(message.data.len()) > MAX_FRAGMENT_BYTES {
+                    (fragment.received, true)
+                } else {
+                    self.bytes += message.data.len();
+                    fragment.bytes += message.data.len();
+                    fragment.parts[fragment_id] = Some(message.data);
+                    fragment.received += 1;
+                    (fragment.received, false)
+                }
+            } else {
+                (fragment.received, false)
+            }
+        };
+        if empty {
+            if received == 0 {
+                self.fragments.remove(&message.packet_id);
+            }
+            return Ok(None);
         }
-        if fragment.received != total {
+        if received != total {
             return Ok(None);
         }
 
@@ -94,6 +138,7 @@ impl Defragger {
             .fragments
             .remove(&message.packet_id)
             .expect("complete Hysteria2 fragment set");
+        self.bytes = self.bytes.saturating_sub(fragment.bytes);
         let length = fragment
             .parts
             .iter()
@@ -112,6 +157,77 @@ impl Defragger {
             data,
             destination: fragment.destination,
         }))
+    }
+
+    fn expire(&mut self, now: Instant) {
+        self.fragments.retain(|_, fragment| {
+            let keep = now.saturating_duration_since(fragment.updated_at) <= FRAGMENT_LIFETIME;
+            if !keep {
+                self.bytes = self.bytes.saturating_sub(fragment.bytes);
+            }
+            keep
+        });
+    }
+}
+
+#[cfg(test)]
+mod defrag_tests {
+    use super::*;
+
+    fn message(packet_id: u16, fragment_id: u8, fragment_total: u8) -> UdpMessage {
+        UdpMessage {
+            session_id: 1,
+            packet_id,
+            fragment_id,
+            fragment_total,
+            destination: "127.0.0.1:53".parse().unwrap(),
+            data: vec![0; 1200],
+        }
+    }
+
+    #[test]
+    fn completed_and_expired_sets_release_accounted_bytes() {
+        let mut defragger = Defragger::default();
+        assert!(defragger.feed(message(1, 0, 2)).unwrap().is_none());
+        assert_eq!(defragger.bytes, 1200);
+        assert_eq!(
+            defragger
+                .feed(message(1, 1, 2))
+                .unwrap()
+                .unwrap()
+                .data
+                .len(),
+            2400
+        );
+        assert_eq!(defragger.bytes, 0);
+        defragger.feed(message(2, 0, 2)).unwrap();
+        defragger.expire(Instant::now() + FRAGMENT_LIFETIME + Duration::from_secs(1));
+        assert!(defragger.fragments.is_empty());
+        assert_eq!(defragger.bytes, 0);
+    }
+
+    #[test]
+    fn oversized_and_invalid_fragment_sets_are_discarded() {
+        let mut defragger = Defragger::default();
+        assert!(defragger.feed(message(1, 0, 0)).unwrap().is_none());
+        assert!(defragger.feed(message(1, 1, 1)).unwrap().is_none());
+        for index in 0..4 {
+            assert!(defragger.feed(message(2, index, 5)).unwrap().is_none());
+        }
+        assert_eq!(defragger.bytes, 0);
+        assert!(defragger.fragments.is_empty());
+    }
+
+    #[test]
+    fn incomplete_fragment_sets_have_entry_and_byte_limits() {
+        let mut defragger = Defragger::default();
+        for id in 0..MAX_FRAGMENT_SETS as u16 {
+            assert!(defragger.feed(message(id, 0, 255)).unwrap().is_none());
+        }
+        assert_eq!(defragger.fragments.len(), MAX_FRAGMENT_SETS);
+        assert!(defragger.feed(message(40_000, 0, 255)).unwrap().is_none());
+        assert_eq!(defragger.fragments.len(), MAX_FRAGMENT_SETS);
+        assert!(defragger.bytes <= MAX_FRAGMENT_BYTES);
     }
 }
 

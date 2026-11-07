@@ -18,7 +18,10 @@ use rustls::{
         CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
     },
 };
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::{
+    sync::{Mutex, Semaphore, mpsc},
+    task::JoinSet,
+};
 
 use crate::congestion::{
     CongestionKind, configure_connection_brutal_with_options, connection_congestion_kind,
@@ -259,9 +262,7 @@ fn build_server_config(
         QuicServerConfig::try_from(tls).map_err(|error| Error::QuicTls(error.to_string()))?;
     let mut transport = base_transport_config(transport_options)?;
     if transport_options.max_concurrent_streams == 0 {
-        transport.max_concurrent_bidi_streams(
-            quinn::VarInt::from_u64(1 << 60).expect("official Hysteria2 stream limit"),
-        );
+        transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(256));
     }
     let mut server_config = ServerConfig::with_crypto(Arc::new(crypto));
     server_config.disable_path_manager(true);
@@ -433,22 +434,30 @@ async fn serve_connection(
         .brutal_debug
         .then(|| ConnectionMetricsTask::spawn(connection.clone(), "server", source, congestion));
     let mut udp_sessions = HashMap::<u32, Weak<Hysteria2PacketConnection>>::new();
+    let mut stream_tasks = JoinSet::new();
+    let stream_limit = 256usize;
     let (released_udp_sender, mut released_udp_receiver) = mpsc::unbounded_channel();
-    loop {
-        tokio::select! {
+    let result = loop {
+        let iteration = async {
+          tokio::select! {
             control = poll_fn(|context| h3_connection.poll_control(context)) => {
                 control.map_err(|error| Error::Http3(error.to_string()))?;
             }
-            stream = connection.accept_bi() => {
+            stream = connection.accept_bi(), if stream_tasks.len() < stream_limit => {
                 let (send, recv) = stream?;
                 let sender = sender.clone();
                 let user = user.clone();
                 let stream_connection = connection.clone();
-                tokio::spawn(async move {
+                stream_tasks.spawn(async move {
                     if let Err(error) = handle_stream(send, recv, stream_connection, user, congestion, sender).await {
                         tracing::debug!(%error, "Hysteria2 stream closed");
                     }
                 });
+            }
+            completed = stream_tasks.join_next(), if !stream_tasks.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    tracing::debug!(%error, "Hysteria2 stream task failed");
+                }
             }
             datagram = connection.read_datagram() => {
                 let message = decode_message(&datagram?)?;
@@ -491,8 +500,16 @@ async fn serve_connection(
                     udp_sessions.remove(&session_id);
                 }
             }
+          }
+          Ok::<(), Error>(())
+        }.await;
+        if let Err(error) = iteration {
+            break Err(error);
         }
-    }
+    };
+    stream_tasks.abort_all();
+    while stream_tasks.join_next().await.is_some() {}
+    result
 }
 
 fn spawn_masquerade_request<S>(
